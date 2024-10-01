@@ -1,9 +1,9 @@
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
-from compressai.compressai.layers import*
 from torch import Tensor
 from typing import Tuple, Any
+import time 
 
 up_kwargs = {'mode': 'nearest'}
 
@@ -24,7 +24,23 @@ __all__=[
     "CheckboardMaskedConv2d",
     "conv3x3",
     "conv1x1",
-    "subpel_conv3x3"
+    "subpel_conv3x3",
+    "goctave3x3",
+    "goctave1x1",
+    "goctave5x5",
+    "goctave5x5s2",
+    "Goctave",
+    "FirstGoctaveConv",
+    "LastGoctaveConv",
+    "GoctaveAttn",
+    "GoctaveRBB",
+    "toctave5x5s2",
+    "TLastOctaveConv",
+    "tgoctave3x3",
+    "tgoctave1x1",
+    "tgoctave5x5",
+    "tgoctave5x5s2",
+    "TLastGoctaveConv"
 ]
 
 
@@ -178,13 +194,13 @@ class OctaveConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0.5, stride=1, padding=1, dilation=1,
                  groups=1, bias=False, up_kwargs=up_kwargs):
         super().__init__()
-        self.weights = nn.parameter(torch.Tensor(out_channels, in_channels, kernel_size[0], kernel_size[1]))
+        self.weights = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size[0], kernel_size[1]))
         self.stride = stride
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
         if bias:
-            self.bias = nn.parameter(torch.Tensor(out_channels))
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
         else:
             self.bias = torch.zeros(out_channels).cuda()
         
@@ -303,6 +319,94 @@ class LastOctaveConv(nn.Module):
         return X_h
 
 
+class TOctaveConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0.5, stride=1, padding=1, dilation=1,
+                 groups=1, bias=False, up_kwargs=up_kwargs):
+        super().__init__()
+        self.weights = nn.Parameter(torch.Tensor(in_channels,out_channels,kernel_size[0], kernel_size[1]))
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.bias = torch.zeros(out_channels).cuda()
+        
+        self.up_kwargs = up_kwargs
+        self.h2g_pool = nn.AvgPool2d(kernel_size=(2,2), stride=2)
+
+        self.in_channels = in_channels
+        self.out_channels =out_channels
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+
+    def forward(self, x):
+        X_h,X_l = x
+        
+        X_h2l = self.h2g_pool(X_h)
+
+        end_h_x = int(self.in_channels*(1-self.alpha_in))
+        end_h_y = int(self.out_channels*(1-self.alpha_out))
+        
+        X_h2h = F.conv_transpose2d(X_h, self.weights[0:end_h_x,0:end_h_y,:,:], self.bias[0:end_h_y], self.stride,
+                        self.padding, self.dilation, self.groups)
+
+        X_l2l = F.conv_transpose2d(X_l, self.weights[end_h_x:,end_h_y:,:,:], self.bias[end_h_y:], self.stride,
+                        self.padding, self.dilation, self.groups)
+
+        X_h2l = F.conv_transpose2d(X_h2l, self.weights[0:end_h_x,end_h_y:,:,:], self.bias[end_h_y:], self.stride,
+                        self.padding, self.dilation, self.groups)
+
+        X_l2h = F.conv_transpose2d(X_l, self.weights[end_h_x:,0:end_h_y,:,:], self.bias[0:end_h_y], self.stride,
+                        self.padding, self.dilation, self.groups)
+
+        X_l2h = F.upsample(X_l2h, scale_factor=2, **self.up_kwargs)
+
+        X_h = X_h2h + X_l2h
+        X_l = X_l2l + X_h2l
+
+        return X_h, X_l 
+
+
+class TLastOctaveConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0.0, stride=1, padding=1, dilation=1,
+                 groups=1, bias=False, up_kwargs = up_kwargs):
+        super().__init__()
+        self.weights = nn.Parameter(torch.Tensor(in_channels, out_channels, kernel_size[0], kernel_size[1]))
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.bias = torch.zeros(out_channels).cuda()
+        self.up_kwargs = up_kwargs
+        self.h2g_pool = nn.AvgPool2d(kernel_size=(2,2), stride=2)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+
+    def forward(self, x):
+        X_h, X_l = x
+
+        end_h_x = int(self.in_channels*(1- self.alpha_in))
+        end_h_y = int(self.out_channels*(1- self.alpha_out))
+
+        X_h2h = F.conv_transpose2d(X_h, self.weights[0:end_h_x, 0:end_h_y, :,:], self.bias[:end_h_y], self.stride,
+                        self.padding, self.dilation, self.groups)
+
+        X_l2h = F.conv_transpose2d(X_l, self.weights[end_h_x:, 0:end_h_y, :,:], self.bias[:end_h_y], self.stride,
+                        self.padding, self.dilation, self.groups)
+        X_l2h = F.upsample(X_l2h, scale_factor=2, **self.up_kwargs)
+
+        X_h = X_h2h + X_l2h
+        return X_h
+
+
 def octave3x3(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
     return OctaveConv(in_channels=in_ch, out_channels=out_ch, kernel_size=(3,3), alpha_in=alpha_in, alpha_out=alpha_out,
                       stride=1, padding=1, bias=True)
@@ -319,6 +423,9 @@ def octave5x5s2(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
     return OctaveConv(in_channels=in_ch, out_channels=out_ch, kernel_size=(5,5), alpha_in=alpha_in, alpha_out=alpha_out,
                       stride=2, padding=2, bias=True)
 
+def toctave5x5s2(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return TOctaveConv(in_channels=in_ch, out_channels=out_ch, kernel_size=(5,5), alpha_in=alpha_in, alpha_out=alpha_out,
+                       stride=2, padding=2, bias=True)
 
 class OctaveAttn(nn.Module):
     """
@@ -332,18 +439,20 @@ class OctaveAttn(nn.Module):
             """Simple residual unit"""
             def __init__(self):
                 super().__init__()
-                self.conv = nn.Sequential(
-                    octave1x1(N,N//2, alpha_in=alpha_in, alpha_out=alpha_out),
-                    nn.ReLU(inplace=True),
-                    octave3x3(N//2, N//2, alpha_in=alpha_in, alpha_out=alpha_out),
-                    nn.ReLU(inplace=True),
-                    octave1x1(N//2, N,alpha_in=alpha_in, alpha_out=alpha_out)
-                )
+                self.octave1x1_1 = octave1x1(N,N//2, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.octave3x3 = octave3x3(N//2, N//2, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.octave1x1_2 = octave1x1(N//2, N,alpha_in=alpha_in, alpha_out=alpha_out)
                 self.relu = nn.ReLU(inplace=True)
             
             def forward(self, x:Tuple):
                 h_identity,l_identity = x
-                h_out, l_out = self.conv(x)
+                h_out, l_out = self.octave1x1_1(x)
+                h_out, l_out = self.relu1(h_out), self.relu1(l_out)
+                h_out, l_out = self.octave3x3((h_out, l_out))
+                h_out, l_out = self.relu2(h_out), self.relu2(l_out)
+                h_out, l_out = self.octave1x1_2((h_out, l_out))
                 h_out += h_identity
                 l_out += l_identity
                 h_out = self.relu(h_out)
@@ -426,46 +535,377 @@ class OctaveRBB(nn.Module):
     
 
 #TODO:for Goctave activation, we use relu
+#makesure alpha_in equals alpha_out
 class Goctave(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0.5, stride=1, padding=1, dilation=1,
                  groups=1, bias=False):
         super().__init__()
-        self.weights = nn.parameter(torch.Tensor(out_channels, in_channels, kernel_size[0], kernel_size[1]))
+        super().__init__()
+        self.weights_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out)),int(in_channels*(1-alpha_in)), kernel_size[0], kernel_size[1]))
+        self.weights_hl = nn.Parameter(torch.Tensor(int(out_channels*alpha_out), int(out_channels*(1-alpha_out)), kernel_size[0], kernel_size[1]))
+        self.weights_ll = nn.Parameter(torch.Tensor(int(out_channels*alpha_out), int(in_channels*alpha_in), kernel_size[0], kernel_size[1]))
+        self.weights_lh = nn.Parameter(torch.Tensor(int(out_channels*alpha_out), int(out_channels*(1-alpha_out)),  kernel_size[0], kernel_size[1]))
+
         self.stride = stride
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
         if bias:
-            self.bias = nn.parameter(torch.Tensor(out_channels))
+            self.bias_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+            self.bias_hl = nn.Parameter(torch.Tensor(int(out_channels*alpha_out)))
+            self.bias_ll = nn.Parameter(torch.Tensor(int(out_channels*alpha_out)))
+            self.bias_lh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
         else:
-            self.bias = torch.zeros(out_channels).cuda()
+            self.bias_hh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+            self.bias_hl = torch.zeros(int(out_channels*alpha_out)).cuda()
+            self.bias_ll = torch.zeros(int(out_channels*alpha_out)).cuda()
+            self.bias_lh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
 
         self.in_channels = in_channels
         self.out_channels =out_channels
         self.alpha_in = alpha_in
         self.alpha_out = alpha_out
 
+
     def forward(self, x):
         X_h,X_l = x
 
-        end_h_x = int(self.in_channels*(1-self.alpha_in))
-        end_h_y = int(self.out_channels*(1-self.alpha_out))
+        X_h2h = F.relu(F.conv2d(X_h, self.weights_hh, self.bias_hh, self.stride, self.padding, self.dilation, self.groups))
+        X_h2l = F.relu(F.conv2d(X_h2h, self.weights_hl, self.bias_hl, 2, self.padding, self.dilation, self.groups))
+        X_l2l = F.relu(F.conv2d(X_l, self.weights_ll, self.bias_ll, self.stride, self.padding, self.dilation, self.groups))
+        X_l2h = F.relu(F.conv_transpose2d(X_l2l, self.weights_lh, self.bias_lh, 2, self.padding, self.dilation, self.groups))   
         
-        X_h2h = F.relu(F.conv2d(X_h, self.weights[0:end_h_y, 0:end_h_x, :,:], self.bias[0:end_h_y], self.stride,
-                        self.padding, self.dilation, self.groups))
-
-        X_l2l = F.relu(F.conv2d(X_l, self.weights[end_h_y:, end_h_x:, :,:], self.bias[end_h_y:], self.stride,
-                        self.padding, self.dilation, self.groups))
-
-        X_h2l = F.relu(F.conv2d(X_h2h, self.weights[end_h_y:, 0: end_h_x, :,:], self.bias[end_h_y:], self.stride*2,
-                        self.padding, self.dilation, self.groups))
-        #X_l2h = F.relu(F.conv_transpose2d(X_l2l, self.weights[]))
-        X_l2h = F.conv2d(X_l, self.weights[0:end_h_y, end_h_x:, :,:], self.bias[0:end_h_y], self.stride,
-                        self.padding, self.dilation, self.groups)
-
-        X_l2h = F.upsample(X_l2h, scale_factor=2, **self.up_kwargs)
-
         X_h = X_h2h + X_l2h
         X_l = X_l2l + X_h2l
 
-        return X_h, X_l    
+        return X_h, X_l      
+
+
+class TGoctave(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0.5, stride=1, padding=1, dilation=1,
+                 groups=1, bias=False):
+        super().__init__()
+        super().__init__()
+        self.weights_hh = nn.Parameter(torch.Tensor(int(in_channels*(1-alpha_in)),int(out_channels*(1-alpha_out)), kernel_size[0], kernel_size[1]))
+        self.weights_hl = nn.Parameter(torch.Tensor(int(out_channels*alpha_out), int(out_channels*(1-alpha_out)),  kernel_size[0], kernel_size[1]))
+        self.weights_ll = nn.Parameter(torch.Tensor(int(in_channels*alpha_in), int(out_channels*alpha_out), kernel_size[0], kernel_size[1]))
+        self.weights_lh = nn.Parameter(torch.Tensor(int(out_channels*alpha_out),int(out_channels*(1-alpha_out)),  kernel_size[0], kernel_size[1]))
+
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        if bias:
+            self.bias_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+            self.bias_hl = nn.Parameter(torch.Tensor(int(out_channels*alpha_out)))
+            self.bias_ll = nn.Parameter(torch.Tensor(int(out_channels*alpha_out)))
+            self.bias_lh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+        else:
+            self.bias_hh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+            self.bias_hl = torch.zeros(int(out_channels*alpha_out)).cuda()
+            self.bias_ll = torch.zeros(int(out_channels*alpha_out)).cuda()
+            self.bias_lh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+
+        self.in_channels = in_channels
+        self.out_channels =out_channels
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+
+
+    def forward(self, x):
+        X_h,X_l = x
+
+        X_h2h = F.relu(F.conv_transpose2d(X_h, self.weights_hh, self.bias_hh, self.stride, self.padding, self.dilation, self.groups))
+        X_h2l = F.relu(F.conv2d(X_h2h, self.weights_hl, self.bias_hl, 2,self.padding, self.dilation, self.groups))
+        X_l2l = F.relu(F.conv_transpose2d(X_l, self.weights_ll, self.bias_ll, self.stride, self.padding, self.dilation, self.groups))
+        X_l2h = F.relu(F.conv_transpose2d(X_l2l, self.weights_lh, self.bias_lh, 2, self.padding, self.dilation, self.groups))   
+        
+        X_h = X_h2h + X_l2h
+        X_l = X_l2l + X_h2l
+
+        return X_h, X_l   
+
+
+class FirstGoctaveConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0, alpha_out=0.5, stride=1, padding=1, dilation=1,
+                 groups=1, bias=False):
+        super().__init__()
+        super().__init__()
+        self.weights_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out)),int(in_channels*(1-alpha_in)), kernel_size[0], kernel_size[1]))
+        self.weights_hl = nn.Parameter(torch.Tensor(int(out_channels*alpha_out), int(out_channels*(1-alpha_out)), kernel_size[0], kernel_size[1]))
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        if bias:
+            self.bias_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+            self.bias_hl = nn.Parameter(torch.Tensor(int(out_channels*alpha_out)))
+        else:
+            self.bias_hh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+            self.bias_hl = torch.zeros(int(out_channels*alpha_out)).cuda()
+        
+        self.in_channels = in_channels
+        self.out_channels =out_channels
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+
+    def forward(self, x):
+        X_h = x
+        X_h2h = F.relu(F.conv2d(X_h, self.weights_hh, self.bias_hh, self.stride, self.padding, self.dilation, self.groups))
+        X_h2l = F.relu(F.conv2d(X_h2h, self.weights_hl, self.bias_hl, 2,self.padding, self.dilation, self.groups)) 
+        X_h = X_h2h 
+        X_l = X_h2l
+        return X_h, X_l  
+
+
+class LastGoctaveConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0, stride=1, padding=1, dilation=1,
+                 groups=1, bias=False):
+        super().__init__()
+        super().__init__()
+        self.weights_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out)),int(in_channels*(1-alpha_in)), kernel_size[0], kernel_size[1]))
+        self.weights_ll = nn.Parameter(torch.Tensor(int(out_channels), int(in_channels*alpha_in), kernel_size[0], kernel_size[1]))
+        self.weights_lh = nn.Parameter(torch.Tensor(int(out_channels), int(out_channels*(1-alpha_out)),kernel_size[0], kernel_size[1]))
+
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        if bias:
+            self.bias_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+            self.bias_ll = nn.Parameter(torch.Tensor(int(out_channels)))
+            self.bias_lh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+        else:
+            self.bias_hh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+            self.bias_ll = torch.zeros(int(out_channels)).cuda()
+            self.bias_lh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+
+        self.in_channels = in_channels
+        self.out_channels =out_channels
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+
+
+    def forward(self, x):
+        X_h,X_l = x
+        
+        X_h2h = F.relu(F.conv2d(X_h, self.weights_hh, self.bias_hh, self.stride, self.padding, self.dilation, self.groups))
+        X_l2l = F.relu(F.conv2d(X_l, self.weights_ll, self.bias_ll, self.stride, self.padding, self.dilation, self.groups))
+        X_l2h = F.relu(F.conv_transpose2d(X_l2l, self.weights_lh, self.bias_lh, 2, self.padding, self.dilation, self.groups)) 
+        X_h = X_h2h + X_l2h
+        return X_h
+
+
+class TLastGoctaveConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, alpha_in=0.5, alpha_out=0, stride=1, padding=1, dilation=1,
+                 groups=1, bias=False):
+        super().__init__()
+        super().__init__()
+        self.weights_hh = nn.Parameter(torch.Tensor(int(in_channels*(1-alpha_in)),int(out_channels*(1-alpha_out)), kernel_size[0], kernel_size[1]))
+        self.weights_ll = nn.Parameter(torch.Tensor(int(in_channels*alpha_in),int(out_channels), kernel_size[0], kernel_size[1]))
+        self.weights_lh = nn.Parameter(torch.Tensor(int(out_channels), int(out_channels*(1-alpha_out)), kernel_size[0], kernel_size[1]))
+
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        if bias:
+            self.bias_hh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+            self.bias_ll = nn.Parameter(torch.Tensor(int(out_channels)))
+            self.bias_lh = nn.Parameter(torch.Tensor(int(out_channels*(1-alpha_out))))
+        else:
+            self.bias_hh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+            self.bias_ll = torch.zeros(int(out_channels)).cuda()
+            self.bias_lh = torch.zeros(int(out_channels*(1-alpha_out))).cuda()
+
+        self.in_channels = in_channels
+        self.out_channels =out_channels
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+
+
+    def forward(self, x):
+        X_h,X_l = x
+        X_h2h = F.relu(F.conv_transpose2d(X_h, self.weights_hh, self.bias_hh, self.stride, self.padding, self.dilation, self.groups))
+        X_l2l = F.relu(F.conv_transpose2d(X_l, self.weights_ll, self.bias_ll, self.stride, self.padding, self.dilation, self.groups))
+        X_l2h = F.relu(F.conv_transpose2d(X_l2l, self.weights_lh, self.bias_lh, 2, self.padding, self.dilation, self.groups)) 
+        X_h = X_h2h + X_l2h
+        return X_h
+
+
+def goctave3x3(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return Goctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(3,3), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=1, padding=1, bias=True)
+
+def goctave1x1(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return Goctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(1,1), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=1, padding=0, bias=True)
+
+def goctave5x5(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return Goctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(5,5), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=1, padding=2, bias=True)
+
+def goctave5x5s2(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return Goctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(5,5), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=2, padding=2, bias=True)
+
+def tgoctave3x3(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return TGoctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(3,3), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=1, padding=1, bias=True)
+
+def tgoctave1x1(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return TGoctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(1,1), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=1, padding=0, bias=True)
+
+def tgoctave5x5(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return TGoctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(5,5), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=1, padding=2, bias=True)
+
+def tgoctave5x5s2(in_ch, out_ch, alpha_in=0.5, alpha_out=0.5):
+    return TGoctave(in_channels=in_ch, out_channels=out_ch, kernel_size=(5,5), alpha_in=alpha_in, alpha_out=alpha_out,
+                      stride=2, padding=2, bias=True)
+
+class GoctaveAttn(nn.Module):
+    """
+    attention module from cheng2020, substitute all conv with octave conv
+    input x:always tuple(x_h and x_l)
+    """
+    def __init__(self, N:int, alpha_in=0.5, alpha_out=0.5):
+        super().__init__()
+
+        class ResidualUnit(nn.Module):
+            """Simple residual unit"""
+            def __init__(self):
+                super().__init__()
+                self.goctave1x1_1 = goctave1x1(N,N//2, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.goctave3x3 = goctave3x3(N//2, N//2, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.goctave1x1_2 = goctave1x1(N//2, N,alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu = nn.ReLU(inplace=True)
+            
+            def forward(self, x:Tuple):
+                h_identity,l_identity = x
+                h_out, l_out = self.goctave1x1_1(x)
+                h_out, l_out  = self.relu1(h_out), self.relu1(l_out)
+                h_out, l_out = self.goctave3x3((h_out, l_out))
+                h_out, l_out = self.relu2(h_out), self.relu2(l_out)
+                h_out, l_out = self.goctave1x1_2((h_out, l_out))
+
+                h_out += h_identity
+                l_out += l_identity
+                h_out = self.relu(h_out)
+                l_out = self.relu(l_out)
+                return h_out, l_out
+        
+        self.conv_a = nn.Sequential(ResidualUnit(), ResidualUnit(), ResidualUnit())
+
+        self.conv_b = nn.Sequential(
+            ResidualUnit(),
+            ResidualUnit(),
+            ResidualUnit(),
+            goctave1x1(N,N,alpha_in=alpha_in, alpha_out=alpha_out)
+        )
+
+    def forward(self, x:Tuple) -> Tuple:
+        h_identity, l_identity = x
+        h_a, l_a = self.conv_a(x)
+        h_b, l_b = self.conv_b(x)
+        h_out, l_out = h_a*torch.sigmoid(h_b), l_a*torch.sigmoid(l_b)
+        h_out, l_out = h_out + h_identity, l_out + l_identity
+        return h_out, l_out
+
+
+class GoctaveRBB(nn.Module):
+    """
+    Octave version for original ELIC rbb
+    args:
+    in_ch(int):number of input channels
+    out_ch(int):number of output channels
+    alpha_in(float)
+    alpha_out(float)
+    """
+    def __init__(self, in_ch:int, alpha_in=0.5, alpha_out=0.5):
+        super().__init__()
+        self.conv1 = goctave1x1(in_ch, in_ch//2, alpha_in=alpha_in, alpha_out=alpha_out)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = goctave3x3(in_ch//2, in_ch//2, alpha_in=alpha_in, alpha_out=alpha_out)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv3 = goctave1x1(in_ch//2, in_ch, alpha_in=alpha_in, alpha_out=alpha_out)
+    
+    def forward(self, x:Tuple) -> Tuple:
+        h_identity, l_identity = x
+        h_out,l_out = self.conv1(x)
+        h_out,l_out = self.relu(h_out), self.relu(l_out)
+        h_out,l_out = self.conv2((h_out, l_out))
+        h_out,l_out = self.relu2(h_out), self.relu2(l_out)
+        h_out, l_out = self.conv3((h_out,l_out))
+
+        h_out, l_out = h_out + h_identity, l_out + l_identity
+        return h_out, l_out
+
+
+def test():
+    x = torch.rand((1,3,128,128))
+    x = x.to("cuda")
+
+    octaveconv1 = octave1x1(in_ch=12, out_ch=12).cuda()
+    octaveconv2 = octave3x3(in_ch=12, out_ch=12).cuda()
+    octaveconv3 = octave5x5(in_ch=12, out_ch=12).cuda()
+    octavefirst1 = FirstOctaveConv(in_channels=3, out_channels=12, kernel_size=(3,3), padding=1).cuda()
+    octavefirst2 = FirstOctaveConv(in_channels=3, out_channels=12, kernel_size=(5,5), stride=2, padding=2).cuda()
+    octavelast1 = LastOctaveConv(in_channels=12, out_channels=6, kernel_size=(3,3), padding=1).cuda()
+    octavelast2 = LastOctaveConv(in_channels=12, out_channels=6, kernel_size=(5,5), stride=2, padding=2).cuda()
+    goctave1 = goctave1x1(in_ch=12, out_ch=12).cuda()
+    goctave2 = goctave5x5s2(in_ch=12, out_ch=12).cuda()
+    goctavefirst1 = FirstGoctaveConv(in_channels=3, out_channels=12, kernel_size=(3,3)).cuda()
+    goctavefirst2 = FirstGoctaveConv(in_channels=3, out_channels=12, kernel_size=(5,5), stride=2, padding=2).cuda()
+    goctavelast1 = LastGoctaveConv(in_channels=12, out_channels=6, kernel_size=(3,3)).cuda()
+    goctavelast2 = LastGoctaveConv(in_channels=12, out_channels=6, kernel_size=(5,5), stride=2, padding=2).cuda()
+
+    x_h,x_l = octavefirst1(x)
+    x_h2, x_l2 = octavefirst2(x)
+
+    out_octave1 = octaveconv1((x_h, x_l))
+    out_octave2 = octaveconv3((x_h,x_l))
+    out_octave_last1 = octavelast1(out_octave1)
+    out_octave_last2 = octavelast2(out_octave2)
+    
+    x_gh, x_gl = goctavefirst1(x)
+    x_hh2, x_gl2 = goctavefirst2(x)
+
+    out_goctave1 = goctave1((x_gh, x_gl))
+    out_goctave2 = goctave2((x_gh, x_gl))
+
+    out_goctave_last1 = goctavelast1(out_goctave1)
+    out_goctave_last2 = goctavelast2(out_goctave2)
+    
+    first_conv = conv3x3(in_ch=3, out_ch=12).cuda()
+    residual_conv = ResidualBottleneckBlock(in_ch=12).cuda()
+    residual_goctave = GoctaveRBB(in_ch=12).cuda()
+
+    first_gconv = FirstGoctaveConv(in_channels=3, out_channels=12, kernel_size=(3,3), padding=1, bias=True).cuda()
+    atten_conv = AttentionBlock(N=12).cuda()
+    atten_goctave = GoctaveAttn(N=12).cuda()
+    
+    for i in range(10):
+        conv_start = time.time()
+        out_conv = first_conv(x)
+        out_conv = residual_conv(out_conv)
+        out_conv = residual_conv(out_conv)
+        out_conv = atten_conv(out_conv)
+        conv_time = time.time() - conv_start
+        print("convtime:{:.4f}".format(conv_time))
+
+    for i in range(10):
+        gconv_start = time.time()
+        gconv_out = first_gconv(x)
+        gconv_out = residual_goctave(gconv_out)
+        gconv_out = residual_goctave(gconv_out)
+        gconv_out = atten_goctave(gconv_out)
+        gconv_time = time.time() - gconv_start
+        print("gconv_time:{:.4f}".format(gconv_time))
+
+
+if __name__=="__main__":
+    test()

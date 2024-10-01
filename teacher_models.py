@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from compressai.compressai.models import CompressionModel
-from compressai.compressai.entropy_models import GaussianConditional, GaussianMixtureConditional
+from compressai.compressai.entropy_models import GaussianConditional, GaussianMixtureConditional, EntropyBottleneck
 from MyUtils.layers import*
 from compressai.compressai.ops import quantize_ste
 from compressai.compressai.models.utils import update_registered_buffers
@@ -10,10 +10,14 @@ import compressai.compressai
 from torch import Tensor
 import time
 from ptflops import get_model_complexity_info
+from torchsummary import summary
+from thop import profile, clever_format
+
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
 SCALES_MAX = 256
 SCALES_LEVELS = 64
+TINY = 1e-8
 def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
     return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
 
@@ -243,7 +247,7 @@ class ELIC_original(CompressionModel):
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-            "latent":{"y":y,"z":z}
+            "latent_norm":(y-latent_means)/(latent_scales+TINY)
         }
 
     def load_state_dict(self, state_dict):
@@ -285,7 +289,10 @@ class ELIC_original(CompressionModel):
         z_enc_start = time.time()
         z = self.h_a(y)
         z_enc = time.time() - z_enc_start
+        z_compress_time = time.time()
         z_strings = self.entropy_bottleneck.compress(z)
+        z_compress_time = time.time() - z_compress_time
+
         z_offset = self.entropy_bottleneck._get_medians()
         z_tmp = z - z_offset
         z_hat = quantize_ste(z_tmp) + z_offset
@@ -300,7 +307,7 @@ class ELIC_original(CompressionModel):
 
         y_strings = []
         y_hat_slices = []
-        params_start = time.time()
+        y_compress_time = 0
         for slice_index, y_slice in enumerate(y_slices):
             if slice_index == 0:
                 support_slices = []
@@ -334,9 +341,12 @@ class ELIC_original(CompressionModel):
             means_anchor_encode[:, :, 1::2, :] = means_anchor[:, :, 1::2, 1::2]
             scales_anchor_encode[:, :, 0::2, :] = scales_anchor[:, :, 0::2, 0::2]
             scales_anchor_encode[:, :, 1::2, :] = scales_anchor[:, :, 1::2, 1::2]
-
+            compress_anchor = time.time()
             indexes_anchor = self.gaussian_conditional.build_indexes(scales_anchor_encode)
             anchor_strings = self.gaussian_conditional.compress(y_anchor_encode, indexes_anchor, means=means_anchor_encode)
+            compress_anchor = time.time() - compress_anchor
+            y_compress_time += compress_anchor
+
             anchor_quantized = self.quantizer.quantize(y_anchor_encode-means_anchor_encode, "ste") + means_anchor_encode
             #anchor_quantized = self.gaussian_conditional.decompress(anchor_strings, indexes_anchor, means=means_anchor_encode)
             y_anchor_decode[:, :, 0::2, 0::2] = anchor_quantized[:, :, 0::2, :]
@@ -359,10 +369,12 @@ class ELIC_original(CompressionModel):
             means_non_anchor_encode[:, :, 1::2, :] = means_non_anchor[:, :, 1::2, 0::2]
             scales_non_anchor_encode[:, :, 0::2, :] = scales_non_anchor[:, :, 0::2, 1::2]
             scales_non_anchor_encode[:, :, 1::2, :] = scales_non_anchor[:, :, 1::2, 0::2]
-
+            compress_non_anchor = time.time()
             indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_non_anchor_encode)
             non_anchor_strings = self.gaussian_conditional.compress(y_non_anchor_encode, indexes_non_anchor,
                                                                     means=means_non_anchor_encode)
+            compress_non_anchor = time.time() - compress_non_anchor
+            y_compress_time += compress_non_anchor
             non_anchor_quantized = self.quantizer.quantize(y_non_anchor_encode-means_non_anchor_encode, "ste") + means_non_anchor_encode
             #non_anchor_quantized = self.gaussian_conditional.decompress(non_anchor_strings, indexes_non_anchor,
             #                                                            means=means_non_anchor_encode)
@@ -376,9 +388,9 @@ class ELIC_original(CompressionModel):
 
             y_strings.append([anchor_strings, non_anchor_strings])
         whole_time = time.time()-whole_time
-        params_time = time.time() - params_start
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:],
-                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "params": params_time,"whole":whole_time}}
+                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "y_compress_time":y_compress_time,
+                         "z_compress_time":z_compress_time,"whole":whole_time}}
 
 
     def decompress(self, strings, shape):
@@ -387,7 +399,10 @@ class ELIC_original(CompressionModel):
         # FIXME: we don't respect the default entropy coder and directly call thse
         # range ANS decoder
         whole_time = time.time()
+        z_decompress_time = time.time()
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        z_decompress_time = time.time() - z_decompress_time
+
         B, _, _, _ = z_hat.size()
         z_dec = time.time()
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
@@ -399,8 +414,8 @@ class ELIC_original(CompressionModel):
         ctx_params_anchor = torch.zeros((B, self.M*2, z_hat.shape[2] * 4, z_hat.shape[3] * 4)).to(z_hat.device)
         ctx_params_anchor_split = torch.split(ctx_params_anchor, [2 * i for i in self.groups[1:]], 1)
 
-        params_time = time.time()
         y_hat_slices = []
+        y_decompress_time = 0
         for slice_index in range(len(self.groups) - 1):
             if slice_index == 0:
                 support_slices = []
@@ -431,10 +446,13 @@ class ELIC_original(CompressionModel):
             scales_anchor_encode[:, :, 0::2, :] = scales_anchor[:, :, 0::2, 0::2]
             scales_anchor_encode[:, :, 1::2, :] = scales_anchor[:, :, 1::2, 1::2]
 
+            anchor_decompress = time.time()
             indexes_anchor = self.gaussian_conditional.build_indexes(scales_anchor_encode)
             anchor_strings = y_strings[slice_index][0]
             anchor_quantized = self.gaussian_conditional.decompress(anchor_strings, indexes_anchor,
                                                                     means=means_anchor_encode)
+            anchor_decompress = time.time() - anchor_decompress
+            y_decompress_time += anchor_decompress
 
             y_anchor_decode[:, :, 0::2, 0::2] = anchor_quantized[:, :, 0::2, :]
             y_anchor_decode[:, :, 1::2, 1::2] = anchor_quantized[:, :, 1::2, :]
@@ -451,11 +469,14 @@ class ELIC_original(CompressionModel):
             means_non_anchor_encode[:, :, 1::2, :] = means_non_anchor[:, :, 1::2, 0::2]
             scales_non_anchor_encode[:, :, 0::2, :] = scales_non_anchor[:, :, 0::2, 1::2]
             scales_non_anchor_encode[:, :, 1::2, :] = scales_non_anchor[:, :, 1::2, 0::2]
-
+            
+            non_anchor_decompress = time.time()
             indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_non_anchor_encode)
             non_anchor_strings = y_strings[slice_index][1]
             non_anchor_quantized = self.gaussian_conditional.decompress(non_anchor_strings, indexes_non_anchor,
                                                                         means=means_non_anchor_encode)
+            non_anchor_decompress = time.time() - non_anchor_decompress
+            y_decompress_time += non_anchor_decompress
 
             y_non_anchor_quantized = torch.zeros_like(means_anchor)
             y_non_anchor_quantized[:, :, 0::2, 1::2] = non_anchor_quantized[:, :, 0::2, :]
@@ -464,13 +485,12 @@ class ELIC_original(CompressionModel):
             y_slice_hat = y_anchor_decode + y_non_anchor_quantized
             y_hat_slices.append(y_slice_hat)
         y_hat = torch.cat(y_hat_slices, dim=1)
-        params_time = time.time()-params_time
 
         y_dec_start = time.time()
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         y_dec = time.time() - y_dec_start
         whole_time = time.time() - whole_time
-        return {"x_hat": x_hat, "time":{"z_dec":z_dec,"y_dec": y_dec, "params":params_time, "whole":whole_time}}
+        return {"x_hat": x_hat, "time":{"z_dec":z_dec,"y_dec": y_dec, "z_decompress_time":z_decompress_time,"y_decompress_time":y_decompress_time,"whole":whole_time}}
 
 
 class ELICHyper(CompressionModel):
@@ -538,14 +558,6 @@ class ELICHyper(CompressionModel):
             conv3x3(N*3//2, 2*M),
         )
 
-        self.ParamAggregation = nn.Sequential(
-            conv1x1(2*M,640),
-            nn.ReLU(inplace=True),
-            conv1x1(640, 512),
-            nn.ReLU(inplace=True),
-            conv1x1(512,2*M)
-        )
-
         self.quantizer = Quantizer()
 
         self.gaussian_conditional = GaussianConditional(None)
@@ -585,7 +597,7 @@ class ELICHyper(CompressionModel):
             z_hat = quantize_ste(z_tmp) + z_offset
 
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
-        _, y_likelihoods = self.gaussian_conditional(y, latent_scales,latent_means)
+        _, y_likelihoods = self.gaussian_conditional(y, latent_scales, latent_means)
         if noisequant:
             y_hat = self.quantizer.quantize(y, quantize_type="ste")
         else:
@@ -594,7 +606,7 @@ class ELICHyper(CompressionModel):
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-            "latent":{"y":y,"z":z}
+            "latent_norm":(y-latent_means)/(latent_scales+TINY)
         }
 
 
@@ -608,7 +620,9 @@ class ELICHyper(CompressionModel):
         z_enc_start = time.time()
         z = self.h_a(y)
         z_enc = time.time() - z_enc_start
+        z_compress_time = time.time()
         z_strings = self.entropy_bottleneck.compress(z)
+        z_compress_time = time.time() - z_compress_time
         
         z_offset = self.entropy_bottleneck._get_medians().detach()
         z_tmp = z - z_offset
@@ -619,49 +633,381 @@ class ELICHyper(CompressionModel):
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
         z_dec = time.time() - z_dec_start
 
+        y_compress_time = time.time()
         indexes = self.gaussian_conditional.build_indexes(latent_scales)
         y_strings = self.gaussian_conditional.compress(y, indexes=indexes, means=latent_means)
+        y_compress_time = time.time()
         whole_time = time.time() - whole_time
-        params_time = 0
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:],
-                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "params": params_time,"whole":whole_time}}
+                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec,"whole":whole_time,
+                "z_compress_time":z_compress_time, "y_compress_time":y_compress_time}}
 
 
     def decompress(self, strings, shape):
         assert isinstance(strings, list) and len(strings) == 2
         whole_time = time.time()
+        z_decompress_time = time.time()
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        z_decompress_time = time.time() -  z_decompress_time
         B, _, _, _ = z_hat.size()
         z_dec = time.time()
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
         z_dec = time.time() - z_dec
 
-        y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
         y_strings = strings[0]
         indexes = self.gaussian_conditional.build_indexes(latent_scales)
+        y_decompress_time = time.time()
         y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=latent_means)
+        y_decompress_time = time.time() - y_decompress_time
+
         y_dec = time.time()
         x_hat = self.g_s(y_hat)
         y_dec = time.time() - y_dec
-        params_time = 0
         whole_time = time.time() - whole_time
-        return {"x_hat": x_hat, "time":{"z_dec":z_dec, "y_dec": y_dec, "params":params_time, "whole":whole_time}}
+        return {"x_hat": x_hat, "time":{"z_dec":z_dec, "y_dec": y_dec, "whole":whole_time,
+                                        "z_decompress_time":z_decompress_time,"y_decompress_time":y_decompress_time}}
 
 
 #ELICHyper model with Octave convolution
 class ELICOctave(CompressionModel):
-    pass
+    def __init__(self, N=192, M=320, alpha_in=0.5, alpha_out=0.5):
+        super().__init__(entropy_bottleneck_channels=int(4*N*(1-alpha_out)+alpha_out*N))
+        self.N = int(N)
+        self.M = int(M)
+        """
+             N: channel number of main network
+             M: channnel number of latent space
+             
+        """
+        class H_A(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.octave1 = octave3x3(M,N, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.octave2 = octave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.octave3 = octave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out)
+
+            def forward(self, x):
+                h_out, l_out = self.octave1(x)
+                h_out, l_out = self.relu1(h_out), self.relu1(l_out)
+                h_out, l_out = self.octave2((h_out, l_out))
+                h_out, l_out = self.relu2(h_out), self.relu2(l_out)
+                h_out, l_out = self.octave3((h_out, l_out))
+                return h_out, l_out
+
+        class H_S(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.octave1 = toctave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.octave2 = toctave5x5s2(N, N*3//2, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.octave3 = octave3x3(N*3//2, 2*M, alpha_in=alpha_in, alpha_out=alpha_out)
+            
+            def forward(self, x):
+                h_out, l_out = self.octave1(x)
+                h_out, l_out = self.relu1(h_out), self.relu2(l_out)
+                h_out, l_out = self.octave2((h_out, l_out))
+                h_out, l_out = self.relu2(h_out), self.relu2(l_out)
+                h_out, l_out = self.octave3((h_out, l_out))
+                return h_out, l_out
+
+        self.g_a = nn.Sequential(
+            FirstOctaveConv(in_channels=3, out_channels=N, kernel_size=(5,5), stride=2,
+                             padding=2,bias=True,alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            octave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveAttn(N, alpha_in=alpha_in, alpha_out=alpha_out),
+            octave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            octave5x5s2(N,M, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveAttn(M, alpha_in=alpha_in, alpha_out=alpha_out)
+        )
+
+        self.g_s = nn.Sequential(
+            OctaveAttn(M, alpha_in=alpha_in, alpha_out=alpha_out),
+            toctave5x5s2(in_ch=M, out_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),    
+            toctave5x5s2(in_ch=N, out_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveAttn(N,alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            toctave5x5s2(in_ch=N, out_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            OctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            TLastOctaveConv(in_channels=N,out_channels=3,kernel_size=(5,5), padding=2, stride=2, bias=True, alpha_in=alpha_in)
+        )
+
+        self.h_a = H_A()
+         
+        self.h_s = H_S()
+
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+        self.quantizer = Quantizer()
+        #self.entropy_bottleneck = EntropyBottleneck()
+        self.gaussian_conditional = GaussianConditional(None)
+        self.shuffle = nn.PixelShuffle(2)
+        self.unshuffle = nn.PixelUnshuffle(2)
+
+    def forward(self, x, noisequant=False):
+        y_h, y_l = self.g_a(x)
+        z_h, z_l = self.h_a((y_h, y_l))
+        z_h_unshuffle = self.unshuffle(z_h)
+        z_encode = torch.concatenate([z_h_unshuffle, z_l], dim=1)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z_encode)
+        if not noisequant:
+            z_offset = self.entropy_bottleneck._get_medians()
+            z_tmp = z_encode - z_offset
+            z_hat = quantize_ste(z_tmp) + z_offset
+
+        z_hat_h = self.shuffle(z_hat[:,0:int(4*self.N*(1-self.alpha_out)),:,:])
+        z_hat_l = z_hat[:,int(4*self.N*(1-self.alpha_out)):,:,:]
+
+        params_h, params_l = self.h_s((z_hat_h, z_hat_l))
+        h_means, h_scales = torch.chunk(params_h,2,dim=1)
+        l_means, l_scales = torch.chunk(params_l,2,dim=1)
+
+        _, h_likelihoods = self.gaussian_conditional(y_h, h_scales, h_means)
+        _, l_likelihoods = self.gaussian_conditional(y_l, l_scales, l_means)
+
+        if noisequant:
+            h_hat = self.quantizer.quantize(y_h, quantize_type="ste")
+            l_hat = self.quantizer.quantize(y_l, quantize_type="ste")
+        else:
+            h_hat = self.quantizer.quantize(y_h - h_means, quantize_type="ste") + h_means
+            l_hat =  self.quantizer.quantize(y_l - l_means, quantize_type="ste") + l_means
+
+        x_hat = self.g_s((h_hat, l_hat))
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"h":h_likelihoods, "l":l_likelihoods, "z": z_likelihoods},
+            "latent_norm":{"h_norm":(y_h-h_means)/(h_scales+TINY),"l_norm":(y_l-l_means)/(l_scales+TINY)}
+        }
+    
+
+    def compress(self, x):
+        """
+        y_enc:g_a
+        z_enc:h_a
+        z_compress_time:encode z with rANS
+        z_dec:h_s
+        y_compress_time:encode y with rANS
+        whole_time:compress function time
+        """
+        whole_time = time.time()
+        y_enc_start = time.time()
+        y_h, y_l = self.g_a(x)
+        y_enc = time.time() - y_enc_start
+        
+        z_enc = time.time()
+        z_h, z_l = self.h_a((y_h, y_l))
+        z_h_unshuffle = self.unshuffle(z_h)
+        z_encode = torch.concatenate([z_h_unshuffle, z_l], dim=1)
+        z_enc = time.time() - z_enc
+
+        z_compress_time = time.time()
+        z_strings = self.entropy_bottleneck.compress(z_encode)
+        z_compress_time = time.time() - z_compress_time
+
+        z_offset = self.entropy_bottleneck._get_medians().detach()
+        z_tmp = z_encode - z_offset
+        z_hat = torch.round(z_tmp) + z_offset
+
+        z_hat_h = self.shuffle(z_hat[:,0:int(4*self.N*(1-self.alpha_out)),:,:])
+        z_hat_l = z_hat[:,int(4*self.N*(1-self.alpha_out)):,:,:]
+        
+        z_dec = time.time()
+        params_h, params_l = self.h_s((z_hat_h, z_hat_l))
+        z_dec = time.time() - z_dec
+
+        h_means, h_scales = torch.chunk(params_h, 2, dim=1)
+        l_means, l_scales = torch.chunk(params_l, 2, dim=1)
+        
+        y_compress_time = time.time()
+        h_index = self.gaussian_conditional.build_indexes(h_scales)
+        l_index = self.gaussian_conditional.build_indexes(l_scales)
+        h_strings = self.gaussian_conditional.compress(inputs=y_h, indexes=h_index, means=h_means)
+        l_strings = self.gaussian_conditional.compress(inputs=y_l, indexes=l_index, means=l_means)
+        y_compress_time = time.time() - y_compress_time
+        whole_time = time.time() - whole_time
+
+        return {"strings": [h_strings, l_strings, z_strings], "shape": z_encode.size()[-2:],
+                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "params": 0,"whole":whole_time,"z_compress_time":z_compress_time,"y_compress_time":y_compress_time}}
 
 
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 2
+        whole_time = time.time()
+        z_decompress_time = time.time()
+        z_hat = self.entropy_bottleneck.decompress(strings[2], shape)
+        z_decompress_time = time.time() - z_decompress_time
+
+        z_hat_h = self.shuffle(z_hat[:,0:int(4*self.N*(1-self.alpha_out)),:,:])
+        z_hat_l = z_hat[:,int(4*self.N*(1-self.alpha_out)):,:,:]
+
+        z_dec = time.time()
+        params_h, params_l = self.h_s((z_hat_h, z_hat_l))
+        z_dec = time.time() - z_dec
+        
+        h_means, h_scales = torch.chunk(params_h, 2, dim=1)
+        l_means, l_scales = torch.chunk(params_l, 2, dim=1)
+
+        y_decompress_time = time.time()
+        h_index = self.gaussian_conditional.build_indexes(h_scales)
+        l_index = self.gaussian_conditional.build_indexes(l_scales)
+        h_hat = self.gaussian_conditional.decompress(strings[0], h_index, means=h_means)
+        l_hat = self.gaussian_conditional.decompress(strings[1], l_index, means=l_means)
+        y_decompress_time = time.time() - y_decompress_time
+
+        y_dec = time.time()
+        x_hat = self.g_s((h_hat, l_hat))
+        y_dec = time.time() - y_dec
+        params_time = 0
+        whole_time = time.time() - whole_time
+        return {"x_hat": x_hat, "time":{"z_dec":z_dec, "y_dec": y_dec, "z_decompress_time":z_decompress_time,
+                                        "y_decompress_time":y_decompress_time,"params":params_time, "whole":whole_time}}
+    
+    def load_state_dict(self, state_dict):
+        update_registered_buffers(
+            self.gaussian_conditional,
+            "gaussian_conditional",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        super().load_state_dict(state_dict)
+
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        net = cls()
+        net.load_state_dict(state_dict)
+        return net
+
+    def update(self, scale_table=None, force=False):
+        if scale_table is None:
+            scale_table = get_scale_table()
+        updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
+        updated |= super().update(force=force)
+        return updated
+    
+
+#ELICHyper model with GOctave convolution alpha_in必须等于alpha_out
 class ELICGOctave(ELICOctave):
-    pass
+    def __init__(self, N=192, M=320, alpha_in=0.5, alpha_out=0.5):
+        super().__init__(alpha_in=alpha_in, alpha_out=alpha_out)
+        self.N = int(N)
+        self.M = int(M)
+        """
+             N: channel number of main network
+             M: channnel number of latent space
+             
+        """
+        class H_A(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.goctave1 = goctave3x3(M,N, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.goctave2 = goctave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.goctave3 = goctave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out)
 
+            def forward(self, x):
+                h_out, l_out = self.goctave1(x)
+                h_out, l_out = self.relu1(h_out), self.relu1(l_out)
+                h_out, l_out = self.goctave2((h_out, l_out))
+                h_out, l_out = self.relu2(h_out), self.relu2(l_out)
+                h_out, l_out = self.goctave3((h_out, l_out))
+                return h_out, l_out
+
+        class H_S(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.goctave1 = tgoctave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.goctave2 = tgoctave5x5s2(N, N*3//2, alpha_in=alpha_in, alpha_out=alpha_out)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.goctave3 = goctave3x3(N*3//2, 2*M, alpha_in=alpha_in, alpha_out=alpha_out)
+            
+            def forward(self, x):
+                h_out, l_out = self.goctave1(x)
+                h_out, l_out = self.relu1(h_out), self.relu2(l_out)
+                h_out, l_out = self.goctave2((h_out, l_out))
+                h_out, l_out = self.relu2(h_out), self.relu2(l_out)
+                h_out, l_out = self.goctave3((h_out, l_out))
+                return h_out, l_out
+
+
+        self.g_a = nn.Sequential(
+            FirstGoctaveConv(in_channels=3, out_channels=N, kernel_size=(5,5), stride=2,
+                             padding=2,bias=True,alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            goctave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveAttn(N, alpha_in=alpha_in, alpha_out=alpha_out),
+            goctave5x5s2(N,N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            goctave5x5s2(N,M, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveAttn(M, alpha_in=alpha_in, alpha_out=alpha_out)
+        )
+
+        self.g_s = nn.Sequential(
+            GoctaveAttn(M, alpha_in=alpha_in, alpha_out=alpha_out),
+            tgoctave5x5s2(in_ch=M, out_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),    
+            tgoctave5x5s2(in_ch=N, out_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveAttn(N,alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            tgoctave5x5s2(in_ch=N, out_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            GoctaveRBB(in_ch=N, alpha_in=alpha_in, alpha_out=alpha_out),
+            TLastGoctaveConv(N,3,kernel_size=(5,5), padding=2, stride=2, bias=True, alpha_in=alpha_in)
+        )
+        
+        self.h_a = H_A()
+        self.h_s = H_S()
+
+        self.quantizer = Quantizer()
+        self.gaussian_conditional = GaussianConditional(None)
+        self.shuffle = nn.PixelShuffle(2)
+        self.unshuffle = nn.PixelUnshuffle(2)
+        self.alpha_in = alpha_in
+        self.alpha_out = alpha_out
+    
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        net = cls()
+        net.load_state_dict(state_dict)
+        return net
 
 
 if __name__=="__main__":
-    x = torch.zeros((1,3,128,128),device="cuda")
+    """
     net = ELIC_original().cuda()
-    out_forward = net(x)
     net.update()
     entropy_coder = compressai.compressai.available_entropy_coders()[0]
     compressai.compressai.set_entropy_coder(entropy_coder)
@@ -671,9 +1017,30 @@ if __name__=="__main__":
     print('flops: ', flops, 'params: ', params)
     
     net_h = ELICHyper().cuda()
-    out_forward = net_h(x)
     net_h.update()
     out_compress = net_h.compress(x)
     out_decompress = net_h.decompress(out_compress["strings"], out_compress["shape"])
     flops, params = get_model_complexity_info(net_h, (3, 256, 256), as_strings=True, print_per_layer_stat=True)
     print('flops: ', flops, 'params: ', params)
+    flops, params = profile(net, inputs=(x,))
+    flops, params = clever_format([flops, params],"%.3f")
+    print("FLOPs: %s" %(flops))
+    print("params:%s" %(params))
+    """
+    net = ELICGOctave().eval().to("cuda")
+    net.update()
+    entropy_coder = compressai.compressai.available_entropy_coders()[0]
+    compressai.compressai.set_entropy_coder(entropy_coder)
+    for i in range(3):
+        x = torch.rand((1,3,768,512),device="cuda")
+        compress_time = time.time()
+        out_compress = net.compress(x)
+        compress_time = time.time() - compress_time
+
+        decompress_time = time.time()
+        out_decompress = net.decompress(out_compress["strings"], out_compress["shape"])
+        decompress_time = time.time() - decompress_time
+        print("compress_time:{:.4f}".format(compress_time))
+        print("decopmress_time:{:.4f}".format(decompress_time))
+    #flops, params = get_model_complexity_info(net, (3, 256, 256), as_strings=True, print_per_layer_stat=True)
+    #print('flops: ', flops, 'params: ', params)

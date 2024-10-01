@@ -36,6 +36,13 @@ from MyUtils.utils.utils import DelfileList, load_checkpoint
 from teacher_models import*
 
 
+MyTeacherModels = {
+    "ELIC_original":ELIC_original,
+    "ELICHyper": ELICHyper,
+    "ELICOctave": ELICOctave
+}
+
+
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
@@ -65,6 +72,53 @@ class RateDistortionLoss(nn.Module):
         out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
 
         return out
+
+class RateDistortionLoss2(nn.Module):
+    """Custom rate distortion loss with a Lagrangian parameter."""
+
+    def __init__(self, lmbda=1e-2):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+        out["h_bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"]["h"]
+        )
+        out["l_bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"]["l"]
+        )
+        out["z_bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"]["z"]
+        )
+        out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
+        out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
+
+        return out
+    
+
+#TODO:distangle loss
+class SpatialDistangleLoss(nn.Module):
+    pass
+
+class ChannelDistangleLoss(nn.Module):
+    pass
+
+
+class BiDistangleLoss(nn.Module):
+    pass
+
 
 
 class AverageMeter:
@@ -135,6 +189,8 @@ def train_one_epoch(
     train_loss = AverageMeter()
     train_bpp_loss = AverageMeter()
     train_y_bpp_loss = AverageMeter()
+    train_l_bpp_loss = AverageMeter()
+    train_h_bpp_loss = AverageMeter()
     train_z_bpp_loss = AverageMeter()
     train_mse_loss = AverageMeter()
     start = time.time()
@@ -146,11 +202,19 @@ def train_one_epoch(
         out_net = model(d, noisequant)
 
         out_criterion = criterion(out_net, d)
-        train_bpp_loss.update(out_criterion["bpp_loss"].item())
-        train_y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
-        train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
-        train_loss.update(out_criterion["loss"].item())
-        train_mse_loss.update(out_criterion["mse_loss"].item())
+        if len(out_criterion)==5:
+            train_bpp_loss.update(out_criterion["bpp_loss"].item())
+            train_y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
+            train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
+            train_loss.update(out_criterion["loss"].item())
+            train_mse_loss.update(out_criterion["mse_loss"].item())
+        else:
+            train_bpp_loss.update(out_criterion["bpp_loss"].item())
+            train_l_bpp_loss.update(out_criterion["l_bpp_loss"].item())
+            train_h_bpp_loss.update(out_criterion["h_bpp_loss"].item())
+            train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
+            train_loss.update(out_criterion["loss"].item())
+            train_mse_loss.update(out_criterion["mse_loss"].item())   
 
         out_criterion["loss"].backward()
         if clip_max_norm > 0:
@@ -229,6 +293,9 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
     parser.add_argument(
         "-d", "--dataset", type=str, required=True, help="Training dataset"
+    )
+    parser.add_argument(
+        "-m","--model", type=str, choices=["ELIC_original","ELICHyper","ELICOctave"]
     )
     parser.add_argument(
         "--N",
@@ -356,8 +423,15 @@ def main(argv):
         shuffle=False,
         pin_memory=(device == "cuda"),
     )
+    
+    if args.model== "ELIC_original" or "ELICHyper":
+        net = MyTeacherModels[args.model](N=args.N, M=args.M)
+        criterion = RateDistortionLoss(lmbda=args.lmbda)
+    else:
+        net = MyTeacherModels[args.model](N=args.N, M=args.M, alpha_in=args.alpha, alpha_out=args.alpha)
+        criterion = RateDistortionLoss2(lmbda=args.lmbda)
 
-    net = ELIC_original(N=args.N, M=args.M)
+    #TODO:other octave models
     net = net.to(device)
     if not os.path.exists(args.savepath):
         try:
@@ -371,7 +445,7 @@ def main(argv):
     optimizer, aux_optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.3, patience=8)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3800], gamma=0.1)
-    criterion = RateDistortionLoss(lmbda=args.lmbda)
+    
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
