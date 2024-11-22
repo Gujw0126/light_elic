@@ -23,9 +23,9 @@ import os
 import math
 import torch.nn as nn
 from teacher_models import*
-from skip_models import AnnelModel
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
+from skip_models import SKModel, Ann
 
 # from torchvision.datasets.folder
 IMG_EXTENSIONS = (
@@ -58,7 +58,7 @@ def read_image(filepath: str) -> torch.Tensor:
 
 
 @torch.no_grad()
-def inference(model, x, f, outputpath, patch,fre):
+def inference(model, x, f, outputpath, patch):
     x = x.unsqueeze(0)
     imgpath = f.split('/')
     imgpath[-2] = outputpath
@@ -76,15 +76,6 @@ def inference(model, x, f, outputpath, patch,fre):
     padding_bottom = new_h - h - padding_top
     pad = nn.ConstantPad2d((padding_left, padding_right, padding_top, padding_bottom), 0)
     x_padded = pad(x)
-    x_original = x
-    if fre:
-        gaussian_kernel = torch.tensor([[0.0947416,0.118318,0.0947416],[0.118318,0.147761,0.118318],[0.0947416,0.118318,0.0947416]],dtype=torch.float32,device=x.device)
-        #gaussian_kernel = torch.tensor([[0,0,0],[0,1,0],[0,0,0]],dtype=torch.float32,device=x.device)
-        gaussian_kernel = gaussian_kernel.unsqueeze(0).unsqueeze(0).expand([3,1,3,3])
-        bias = torch.tensor([0,0,0],dtype=torch.float32,device=x.device)
-        x_padded = F.conv2d(input=x_padded, weight=gaussian_kernel, bias=bias, stride=1, padding=1,groups=3)
-        x_original = nn.functional.pad(x_padded,[-padding_left, -padding_right, -padding_top, -padding_bottom])
-        torchvision.utils.save_image(x_original, os.path.join(outputpath,"kodim_fre21.png"),nrow=1)
 
     _, _, height, width = x_padded.size()
     start = time.time()
@@ -101,6 +92,7 @@ def inference(model, x, f, outputpath, patch,fre):
 
     num_pixels = x.size(0) * x.size(2) * x.size(3)
     bpp = 0
+    """
     for s in out_enc["strings"]:
         for j in s:
             if isinstance(j, list):
@@ -113,14 +105,22 @@ def inference(model, x, f, outputpath, patch,fre):
             else:
                 bpp += len(j)
     bpp *= 8.0 / num_pixels
+    """
     # bpp = sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
-    z_bpp = len(out_enc["strings"][1][0])* 8.0 / num_pixels
-    y_bpp = bpp - z_bpp
+    y_bpp = len(out_enc["strings"]["y"][0])* 8.0 / num_pixels
+    z_bpp = len(out_enc["strings"]["z"][0])* 8.0 / num_pixels
+    slice_bpp = 0
+    slice_num = len(out_enc["strings"]["slice"])
+    for i in range(slice_num):
+        print(out_enc["strings"]["slice"][i][0])
+        slice_bpp += len(out_enc["strings"]["slice"][i][0])
+    slice_bpp = slice_bpp*8.0/num_pixels
+    bpp = y_bpp + z_bpp + slice_bpp
 
-    torchvision.utils.save_image(out_dec["x_hat"], os.path.join(outputpath,"kodim_fre21_recon.png"), nrow=1)
-    PSNR = psnr(x_original, out_dec["x_hat"])
+    #torchvision.utils.save_image(out_dec["x_hat"], imgPath, nrow=1)
+    PSNR = psnr(x, out_dec["x_hat"])
     with open(csvfile, 'a+') as f:
-        row = [imgpath[-1], bpp * num_pixels, num_pixels, bpp, y_bpp, z_bpp,
+        row = [imgpath[-1], bpp * num_pixels, num_pixels, bpp, y_bpp, z_bpp,slice_bpp,
                torch.nn.functional.mse_loss(x, out_dec["x_hat"]).item() * 255 ** 2, psnr(x, out_dec["x_hat"]),
                ms_ssim(x, out_dec["x_hat"], data_range=1.0).item(), enc_time, dec_time]
                #out_enc["time"]['y_enc'] * 1000,out_dec["time"]['y_dec'] * 1000, out_enc["time"]['z_enc'] * 1000, out_enc["time"]['z_dec'] * 1000]
@@ -134,67 +134,8 @@ def inference(model, x, f, outputpath, patch,fre):
         "decoding_time": dec_time,
     }
 
-@torch.no_grad()
-def inference_entropy_estimation(model, x, f, outputpath, patch):
-    x = x.unsqueeze(0)
-    imgpath = f.split('/')
-    imgpath[-2] = outputpath
-    imgPath = '/'.join(imgpath)
-    csvfile = '/'.join(imgpath[:-1]) + '/result.csv'
-    print('decoding img: {}'.format(f))
-    ########original padding
-    h, w = x.size(2), x.size(3)
-    p = patch  # maximum 6 strides of 2
-    new_h = (h + p - 1) // p * p
-    new_w = (w + p - 1) // p * p
-    padding_left = (new_w - w) // 2
-    padding_right = new_w - w - padding_left
-    padding_top = (new_h - h) // 2
-    padding_bottom = new_h - h - padding_top
-    x_padded = torch.nn.functional.pad(
-        x,
-        (padding_left, padding_right, padding_top, padding_bottom),
-        mode="constant",
-        value=0,
-    )
-    _, _, height, width = x_padded.size()
 
-
-    start = time.time()
-    out_net = model.inference(x_padded)
-
-
-    elapsed_time = time.time() - start
-    out_net["x_hat"] = torch.nn.functional.pad(
-        out_net["x_hat"], (-padding_left, -padding_right, -padding_top, -padding_bottom)
-    )
-    num_pixels = x.size(0) * x.size(2) * x.size(3)
-    bpp = sum(
-        (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-        for likelihoods in out_net["likelihoods"].values()
-    )
-    y_bpp = (torch.log(out_net["likelihoods"]["y"]).sum() / (-math.log(2) * num_pixels))
-    z_bpp = (torch.log(out_net["likelihoods"]["y"]).sum() / (-math.log(2) * num_pixels))
-
-    torchvision.utils.save_image(out_net["x_hat"], imgPath, nrow=1)
-    PSNR = psnr(x, out_net["x_hat"])
-    with open(csvfile, 'a+') as f:
-        row = [imgpath[-1], bpp.item() * num_pixels, num_pixels, bpp.item(), y_bpp.item(), z_bpp.item(),
-               torch.nn.functional.mse_loss(x, out_net["x_hat"]).item() * 255 ** 2, PSNR,
-               ms_ssim(x, out_net["x_hat"], data_range=1.0).item(), elapsed_time / 2.0, elapsed_time / 2.0,
-               out_net["time"]['y_enc'] * 1000, out_net["time"]['y_dec'] * 1000, out_net["time"]['z_enc'] * 1000,
-               out_net["time"]['z_dec'] * 1000, out_net["time"]['params'] * 1000]
-        write = csv.writer(f)
-        write.writerow(row)
-    return {
-        "psnr": PSNR,
-        "bpp": bpp.item(),
-        "encoding_time": elapsed_time / 2.0,  # broad estimation
-        "decoding_time": elapsed_time / 2.0,
-    }
-
-
-def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpath='Recon', patch=576, frequency=False):
+def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpath='Recon', patch=576):
     device = next(model.parameters()).device
     metrics = defaultdict(float)
     imgdir = filepaths[0].split('/')
@@ -206,7 +147,7 @@ def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpat
     if os.path.isfile(csvfile):
         os.remove(csvfile)
     with open(csvfile, 'w') as f:
-        row = ['name', 'bits', 'pixels', 'bpp', 'y_bpp', 'z_bpp', 'mse', 'psnr(dB)', 'ms-ssim', 'enc_time(s)', 'dec_time(s)', 'y_enc(ms)',
+        row = ['name', 'bits', 'pixels', 'bpp', 'y_bpp', 'z_bpp', 'slice_bpp','mse', 'psnr(dB)', 'ms-ssim', 'enc_time(s)', 'dec_time(s)', 'y_enc(ms)',
                'y_dec(ms)', 'z_enc(ms)', 'z_dec(ms)', 'param(ms)']
         write = csv.writer(f)
         write.writerow(row)
@@ -216,14 +157,13 @@ def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpat
             if half:
                 model = model.half()
                 x = x.half()
-            rv = inference(model, x, f, outputpath, patch, frequency)
-        else:
-            rv = inference_entropy_estimation(model, x, f, outputpath, patch)
+            rv = inference(model, x, f, outputpath, patch)
         for k, v in rv.items():
             metrics[k] += v
     for k, v in metrics.items():
         metrics[k] = v / len(filepaths)
     return metrics
+
 
 def setup_args():
     parser = argparse.ArgumentParser(
@@ -272,10 +212,6 @@ def setup_args():
         default=256,
         help="padding patch size (default: %(default)s)",
     )
-    parser.add_argument(
-        "--frequency",
-        action="store_true"
-    )
     return parser
 
 
@@ -292,15 +228,15 @@ def main(argv):
     compressai.compressai.set_entropy_coder(args.entropy_coder)
 
     state_dict = load_state_dict(torch.load(args.paths))
-    model_cls = ELIC_original()
+    model_cls = (M=320, N=192)    
     model = model_cls.from_state_dict(state_dict).eval()
-    model.update()
+
     results = defaultdict(list)
 
     if args.cuda and torch.cuda.is_available():
         model = model.to("cuda")
 
-    metrics = eval_model(model, filepaths, args.entropy_estimation, args.half, args.output_path, args.patch, args.frequency)
+    metrics = eval_model(model, filepaths, args.entropy_estimation, args.half, args.output_path, args.patch)
     for k, v in metrics.items():
         results[k].append(v)
 

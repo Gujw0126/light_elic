@@ -34,12 +34,16 @@ import numpy as np
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from MyUtils.utils.utils import DelfileList, load_checkpoint
 from teacher_models import*
+import logging
+my_logger = logging.getLogger(__name__)
 
 
 MyTeacherModels = {
     "ELIC_original":ELIC_original,
     "ELICHyper": ELICHyper,
-    "ELICOctave": ELICOctave
+    "ELICOctave": ELICOctave,
+    "ELICGOctave": ELICGOctave,
+    "ELICSkip": ELICSkip
 }
 
 
@@ -98,10 +102,16 @@ class RateDistortionLoss2(nn.Module):
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"]["l"]
         )
-        out["z_bpp_loss"] = sum(
+        out["z_h_bpp_loss"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["z"]
+            for likelihoods in output["likelihoods"]["z_h"]
         )
+        out["z_l_bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"]["z_l"]
+        )
+        out["y_bpp_loss"] = out["l_bpp_loss"] + out["h_bpp_loss"]
+        out["z_bpp_loss"] = out["z_h_bpp_loss"] + out["z_l_bpp_loss"]
         out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
         out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
 
@@ -182,7 +192,7 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, noisequant=True,
+    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, logger, noisequant=True,
 ):
     model.train()
     device = next(model.parameters()).device
@@ -191,8 +201,11 @@ def train_one_epoch(
     train_y_bpp_loss = AverageMeter()
     train_l_bpp_loss = AverageMeter()
     train_h_bpp_loss = AverageMeter()
+    train_z_h_bpp_loss = AverageMeter()
+    train_z_l_bpp_loss = AverageMeter()
     train_z_bpp_loss = AverageMeter()
     train_mse_loss = AverageMeter()
+
     start = time.time()
     for i, d in enumerate(train_dataloader):
         d = d.to(device)
@@ -212,7 +225,10 @@ def train_one_epoch(
             train_bpp_loss.update(out_criterion["bpp_loss"].item())
             train_l_bpp_loss.update(out_criterion["l_bpp_loss"].item())
             train_h_bpp_loss.update(out_criterion["h_bpp_loss"].item())
+            train_z_h_bpp_loss.update(out_criterion["z_h_bpp_loss"].item())
+            train_z_l_bpp_loss.update(out_criterion["z_l_bpp_loss"].item())
             train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
+            train_y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
             train_loss.update(out_criterion["loss"].item())
             train_mse_loss.update(out_criterion["mse_loss"].item())   
 
@@ -226,30 +242,59 @@ def train_one_epoch(
         aux_optimizer.step()
 
         if i % 10000 == 0:
-            print(
-                f"Train epoch {epoch}: ["
-                f"{i*len(d)}/{len(train_dataloader.dataset)}"
-                f" ({100. * i / len(train_dataloader):.0f}%)]"
-                f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f} |'
-                f'\ty_Bpp loss: {out_criterion["y_bpp_loss"].item():.4f} |'
-                f'\tz_Bpp loss: {out_criterion["z_bpp_loss"].item():.4f} |'
-                f"\tAux loss: {aux_loss.item():.2f}"
-            )
-    print(f"Train epoch {epoch}: Average losses:"
-          f"\tLoss: {train_loss.avg:.3f} |"
-          f"\tMSE loss: {train_mse_loss.avg:.3f} |"
-          f"\tBpp loss: {train_bpp_loss.avg:.4f} |"
-          f"\ty_Bpp loss: {train_y_bpp_loss.avg:.5f} |"
-          f"\tz_Bpp loss: {train_z_bpp_loss.avg:.5f} |"
-          f"\tTime (s) : {time.time()-start:.4f} |"
-          )
+            if len(out_criterion)==5:
+                 info = f"Train epoch {epoch}: ["\
+                   f"{i*len(d)}/{len(train_dataloader.dataset)}"\
+                   f" ({100. * i / len(train_dataloader):.0f}%)]"\
+                   f'\tLoss: {out_criterion["loss"].item():.3f}|'\
+                    f'\tMSE loss: {out_criterion["mse_loss"].item():.3f}|'\
+                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f}|'\
+                    f'\ty_Bpp loss: {out_criterion["y_bpp_loss"].item():.4f}|'\
+                    f'\tz_Bpp loss: {out_criterion["z_bpp_loss"].item():.4f}|'\
+                    f"\tAux loss: {aux_loss.item():.2f}"
+            else:
+                info = f"Train epoch {epoch}: ["\
+                    f"{i*len(d)}/{len(train_dataloader.dataset)}"\
+                    f" ({100. * i / len(train_dataloader):.0f}%)]"\
+                    f'\tLoss: {out_criterion["loss"].item():.3f}|'\
+                        f'\tMSE loss: {out_criterion["mse_loss"].item():.3f}|'\
+                        f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f}|'\
+                        f'\ty_Bpp loss: {out_criterion["y_bpp_loss"].item():.4f}|'\
+                        f'\tl_Bpp loss: {out_criterion["l_bpp_loss"].item():.4f}|'\
+                        f'\th_Bpp loss: {out_criterion["h_bpp_loss"].item():.4f}|'\
+                        f'\tz_Bpp loss: {out_criterion["z_bpp_loss"].item():.4f}|'\
+                        f'\tz_h_Bpp loss:{out_criterion["z_h_bpp_loss"].item():.4f}|'\
+                        f'\tz_l_Bpp loss:{out_criterion["z_l_bpp_loss"].item():.4f}|'\
+                        f"\tAux loss: {aux_loss.item():.2f}"
+            print(info)
+            logger.info(info)
 
-
+    if len(out_criterion)==5:
+        info = f"Train epoch {epoch}: Average losses:"\
+          f"\tLoss: {train_loss.avg:.3f}|"\
+          f"\tMSE loss: {train_mse_loss.avg:.3f}|"\
+          f"\tBpp loss: {train_bpp_loss.avg:.4f}|"\
+          f"\ty_Bpp loss: {train_y_bpp_loss.avg:.5f}|"\
+          f"\tz_Bpp loss: {train_z_bpp_loss.avg:.5f}|"\
+          f"\tTime (s) : {time.time()-start:.4f}" 
+    else:
+        info = f"Train epoch {epoch}: Average losses:"\
+            f"\tLoss: {train_loss.avg:.3f}|"\
+            f"\tMSE loss: {train_mse_loss.avg:.3f}|"\
+            f"\tBpp loss: {train_bpp_loss.avg:.4f}|"\
+            f"\ty_Bpp loss: {train_y_bpp_loss.avg:.5f}|"\
+            f'\tl_Bpp loss: {train_l_bpp_loss.avg:.5f}|'\
+            f'\th_Bpp loss: {train_h_bpp_loss.avg:.5f}|'\
+            f"\tz_Bpp loss: {train_z_bpp_loss.avg:.5f}|"\
+            f"\tz_h_Bpp loss:{train_z_h_bpp_loss.avg:.5f}|"\
+            f"\tz_l_Bpp loss:{train_z_l_bpp_loss.avg:.5f}|"\
+            f"\tTime (s) : {time.time()-start:.4f}"       
+    print(info)
+    logger.info(info)
     return train_loss.avg, train_bpp_loss.avg, train_mse_loss.avg
 
-def test_epoch(epoch, test_dataloader, model, criterion):
+
+def test_epoch(epoch, test_dataloader, model, criterion, logger):
     model.eval()
     device = next(model.parameters()).device
 
@@ -259,30 +304,56 @@ def test_epoch(epoch, test_dataloader, model, criterion):
     z_bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
+    h_bpp_loss = AverageMeter()
+    l_bpp_loss = AverageMeter()
+    z_h_bpp_loss = AverageMeter()
+    z_l_bpp_loss = AverageMeter()
 
     with torch.no_grad():
         for d in test_dataloader:
             d = d.to(device)
             out_net = model(d)
             out_criterion = criterion(out_net, d)
-
             aux_loss.update(model.aux_loss().item())
-            bpp_loss.update(out_criterion["bpp_loss"].item())
-            y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
-            z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
-            loss.update(out_criterion["loss"].item())
-            mse_loss.update(out_criterion["mse_loss"].item())
-
-    print(
-        f"Test epoch {epoch}: Average losses:"
-        f"\tLoss: {loss.avg:.3f} |"
-        f"\tMSE loss: {mse_loss.avg:.3f} |"
-        f"\tBpp loss: {bpp_loss.avg:.4f} |"
-        f"\ty_Bpp loss: {y_bpp_loss.avg:.4f} |"
-        f"\tz_Bpp loss: {z_bpp_loss.avg:.4f} |"
-        f"\tAux loss: {aux_loss.avg:.4f}\n"
-    )
-
+            if len(out_criterion)==5:  
+                bpp_loss.update(out_criterion["bpp_loss"].item())
+                y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
+                z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
+                loss.update(out_criterion["loss"].item())
+                mse_loss.update(out_criterion["mse_loss"].item())
+            else:
+                bpp_loss.update(out_criterion["bpp_loss"].item())
+                y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
+                z_h_bpp_loss.update(out_criterion["z_h_bpp_loss"].item())
+                z_l_bpp_loss.update(out_criterion["z_l_bpp_loss"].item())
+                z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
+                loss.update(out_criterion["loss"].item())
+                mse_loss.update(out_criterion["mse_loss"].item())
+                h_bpp_loss.update(out_criterion["h_bpp_loss"].item())
+                l_bpp_loss.update(out_criterion["l_bpp_loss"].item())
+    
+    if len(out_criterion)==5:
+        info =  f"Test epoch {epoch}: Average losses:"\
+        f"\tLoss: {loss.avg:.3f}|"\
+        f"\tMSE loss: {mse_loss.avg:.3f}|"\
+        f"\tBpp loss: {bpp_loss.avg:.4f}|"\
+        f"\ty_Bpp loss: {y_bpp_loss.avg:.4f}|"\
+        f"\tz_Bpp loss: {z_bpp_loss.avg:.4f}|"\
+        f"\tAux loss: {aux_loss.avg:.4f}\n" 
+    else:
+        info =  f"Test epoch {epoch}: Average losses:"\
+            f"\tLoss: {loss.avg:.3f}|"\
+            f"\tMSE loss: {mse_loss.avg:.3f}|"\
+            f"\tBpp loss: {bpp_loss.avg:.4f}|"\
+            f"\ty_Bpp loss: {y_bpp_loss.avg:.4f}|"\
+            f"\tl_bpp_loss: {l_bpp_loss.avg:.4f}|"\
+            f"\th_bpp_loss: {h_bpp_loss.avg:.4f}|"\
+            f"\tz_Bpp loss: {z_bpp_loss.avg:.4f}|"\
+            f"\tz_h_Bpp loss:{z_h_bpp_loss.avg:.4f}|"\
+            f"\tz_l_Bpp loss:{z_l_bpp_loss.avg:.4f}|"\
+            f"\tAux loss: {aux_loss.avg:.4f}\n"
+    print(info)
+    logger.info(info)
     return loss.avg, bpp_loss.avg, mse_loss.avg
 
 
@@ -295,7 +366,10 @@ def parse_args(argv):
         "-d", "--dataset", type=str, required=True, help="Training dataset"
     )
     parser.add_argument(
-        "-m","--model", type=str, choices=["ELIC_original","ELICHyper","ELICOctave"]
+        "-m","--model", type=str, choices=["ELIC_original","ELICHyper","ELICOctave","ELICGOctave","ELICSkip"]
+    )
+    parser.add_argument(
+        "-q","--quality", type=int, choices=[1,2,3,4,5,6]
     )
     parser.add_argument(
         "--N",
@@ -308,6 +382,11 @@ def parse_args(argv):
         default=320,
         type=int,
         help="Number of channels of latent",
+    )
+    parser.add_argument(
+        "--alpha",
+        default=0.5,
+        type=float
     )
     parser.add_argument(
         "-e",
@@ -356,7 +435,7 @@ def parse_args(argv):
         "--patch-size",
         type=int,
         nargs=2,
-        default=(256, 256),
+        default=(512, 512),
         help="Size of the patches to be cropped (default: %(default)s)",
     )
     parser.add_argument("--cuda", default=True, action="store_true", help="Use cuda")
@@ -380,12 +459,14 @@ def parse_args(argv):
     parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
     parser.add_argument('--savepath', default='./checkpoint', type=str, help='Path to save the checkpoint')
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
+    parser.add_argument("--finetune", type=str)
     args = parser.parse_args(argv)
     return args
 
 def main(argv):
     args = parse_args(argv)
-
+    log_file = os.path.join(args.savepath, "train.log")
+    logging.basicConfig(filename=log_file, level=logging.INFO)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -423,14 +504,18 @@ def main(argv):
         shuffle=False,
         pin_memory=(device == "cuda"),
     )
-    
-    if args.model== "ELIC_original" or "ELICHyper":
+    """
+    if args.model in ("ELIC_original","ELICHyper","ELICSkip"):
         net = MyTeacherModels[args.model](N=args.N, M=args.M)
+        #net = ELICSkip(quality=args.quality)
         criterion = RateDistortionLoss(lmbda=args.lmbda)
     else:
         net = MyTeacherModels[args.model](N=args.N, M=args.M, alpha_in=args.alpha, alpha_out=args.alpha)
         criterion = RateDistortionLoss2(lmbda=args.lmbda)
-
+        net.reset_parameters()
+    """
+    net = ELICHyper(N=args.N, M=args.M)
+    criterion = RateDistortionLoss(lmbda=args.lmbda)
     #TODO:other octave models
     net = net.to(device)
     if not os.path.exists(args.savepath):
@@ -448,6 +533,12 @@ def main(argv):
     
 
     last_epoch = 0
+    if args.finetune:
+        print("Loading", args.finetune)
+        checkpoint = torch.load(args.finetune, map_location=device)
+        last_epoch=0
+        net.load_state_dict(checkpoint)
+
     if args.checkpoint:  # load from previous checkpoint
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
@@ -474,6 +565,7 @@ def main(argv):
             noisequant = False
         print("noisequant: {}, stemode:{}".format(noisequant, stemode))
         print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        #assert isinstance(criterion, RateDistortionLoss2)
         train_loss, train_bpp, train_mse = train_one_epoch(
             net,
             criterion,
@@ -482,13 +574,14 @@ def main(argv):
             aux_optimizer,
             epoch,
             args.clip_max_norm,
+            my_logger,
             noisequant
         )
         writer.add_scalar('Train/loss', train_loss, epoch)
         writer.add_scalar('Train/mse', train_mse, epoch)
         writer.add_scalar('Train/bpp', train_bpp, epoch)
 
-        loss, bpp, mse = test_epoch(epoch, test_dataloader, net, criterion)
+        loss, bpp, mse = test_epoch(epoch, test_dataloader, net, criterion, my_logger)
         writer.add_scalar('Test/loss', loss, epoch)
         writer.add_scalar('Test/mse', mse, epoch)
         writer.add_scalar('Test/bpp', bpp, epoch)

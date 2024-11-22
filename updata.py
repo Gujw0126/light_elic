@@ -6,6 +6,7 @@ from pathlib import Path
 from teacher_models import *
 from MyUtils.utils import load_checkpoint
 import os
+from skip_models import SKModel,AnnelModel
 
 def setup_args():
     parser = argparse.ArgumentParser()
@@ -32,7 +33,7 @@ def main(argv):
 
     state_dict = load_checkpoint(filepath)
 
-    model_cls = ELICHyper()
+    model_cls = ELICHyper(N=192,M=160)
     net = model_cls.from_state_dict(state_dict)
 
 
