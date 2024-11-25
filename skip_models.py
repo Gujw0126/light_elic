@@ -340,7 +340,7 @@ class SKModel(CompressionModel):
 
 
 #先尝试以下两个分段(均分)的channel-ar的模型
-
+#隔一个取一个 2024、11、22
 class AnnelModel(CompressionModel):
     def __init__(self, M=320, N=192):
         super().__init__()
@@ -606,6 +606,183 @@ class AnnelModel(CompressionModel):
         return cast(Tensor, loss)
 
 
+
+class ELICHyper(CompressionModel):
+    """
+    ELIC Model with only a hyperprior entropy model
+    """
+    def __init__(self, N=192, M=320):
+        super().__init__(entropy_bottleneck_channels=192)
+        self.N = int(N)
+        self.M = int(M)
+        """
+             N: channel number of main network
+             M: channnel number of latent space
+             
+        """
+        self.g_a = nn.Sequential(
+            conv(3, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            conv(N, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            AttentionBlock(N),
+            conv(N, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            conv(N, M),
+            AttentionBlock(M),
+        )
+
+        self.g_s = nn.Sequential(
+            AttentionBlock(M),
+            deconv(M, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            deconv(N, N),
+            AttentionBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            deconv(N, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            deconv(N, 3),
+        )
+
+        self.h_a = nn.Sequential(
+            conv3x3(M, N),
+            nn.ReLU(inplace=True),
+            conv(N, N),
+            nn.ReLU(inplace=True),
+            conv(N, N),
+        )
+
+        self.h_s = nn.Sequential(
+            deconv(N, N),
+            nn.ReLU(inplace=True),
+            deconv(N, N*3//2),
+            nn.ReLU(inplace=True),
+            conv3x3(N*3//2, 2*M),
+        )
+
+        self.quantizer = Quantizer()
+
+        self.gaussian_conditional = GaussianConditional(None)
+
+    def load_state_dict(self, state_dict):
+        update_registered_buffers(
+            self.gaussian_conditional,
+            "gaussian_conditional",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        super().load_state_dict(state_dict)
+
+    @classmethod
+
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        net = cls()
+        net.load_state_dict(state_dict)
+        return net
+
+    def update(self, scale_table=None, force=False):
+        if scale_table is None:
+            scale_table = get_scale_table()
+        updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
+        updated |= super().update(force=force)
+        return updated
+
+    def forward(self, x:Tensor, noisequant=False):
+        y = self.g_a(x)
+        B, C, H, W = y.size() ## The shape of y to generate the mask
+
+        z = self.h_a(y)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        if not noisequant:
+            z_offset = self.entropy_bottleneck._get_medians()
+            z_tmp = z - z_offset
+            z_hat = quantize_ste(z_tmp) + z_offset
+
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        _, y_likelihoods = self.gaussian_conditional(y, latent_scales, latent_means)
+        if noisequant:
+            y_hat = self.quantizer.quantize(y, quantize_type="ste")
+        else:
+            y_hat = self.quantizer.quantize(y-latent_means, quantize_type="ste")+latent_means
+        x_hat = self.g_s(y_hat)
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "latent_norm":(y-latent_means)/(latent_scales+TINY),
+        }
+
+
+    def compress(self,x:Tensor):
+        whole_time = time.time()
+        y_enc_start = time.time()
+        y = self.g_a(x)
+        y_enc = time.time() - y_enc_start
+        B, C, H, W = y.size()  ## The shape of y to generate the mask
+
+        z_enc_start = time.time()
+        z = self.h_a(y)
+        z_enc = time.time() - z_enc_start
+        z_compress_time = time.time()
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_compress_time = time.time() - z_compress_time
+        
+        z_offset = self.entropy_bottleneck._get_medians().detach()
+        z_tmp = z - z_offset
+        z_hat = torch.round(z_tmp) + z_offset
+
+        #z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+        z_dec_start = time.time()
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        z_dec = time.time() - z_dec_start
+
+        y_compress_time = time.time()
+        indexes = self.gaussian_conditional.build_indexes(latent_scales)
+        y_strings = self.gaussian_conditional.compress(y, indexes=indexes, means=latent_means)
+        y_compress_time = time.time()
+        whole_time = time.time() - whole_time
+        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:],
+                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec,"whole":whole_time,
+                "z_compress_time":z_compress_time, "y_compress_time":y_compress_time},
+                "latent": y
+                }
+
+
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 2
+        whole_time = time.time()
+        z_decompress_time = time.time()
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        z_decompress_time = time.time() -  z_decompress_time
+        B, _, _, _ = z_hat.size()
+        z_dec = time.time()
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        z_dec = time.time() - z_dec
+
+        y_strings = strings[0]
+        indexes = self.gaussian_conditional.build_indexes(latent_scales)
+        y_decompress_time = time.time()
+        y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=latent_means)
+        y_decompress_time = time.time() - y_decompress_time
+
+        y_dec = time.time()
+        x_hat = self.g_s(y_hat)
+        y_dec = time.time() - y_dec
+        whole_time = time.time() - whole_time
+        return {"x_hat": x_hat, "time":{"z_dec":z_dec, "y_dec": y_dec, "whole":whole_time,
+                                        "z_decompress_time":z_decompress_time,"y_decompress_time":y_decompress_time}}
 """
     def soft(self, x, noisequant=False,tmp=1.0):
         y = self.g_a(x)
@@ -676,9 +853,221 @@ class AnnelModel(CompressionModel):
 """
  
 
+class HyperGain(CompressionModel):
+    """
+    ELIC Model with only a hyperprior entropy model
+    """
+    def __init__(self, N=192, M=320):
+        super().__init__(entropy_bottleneck_channels=N)
+        self.N = int(N)
+        self.M = int(M)
+        """
+             N: channel number of main network
+             M: channnel number of latent space
+             
+        """
+        self.g_a = nn.Sequential(
+            conv(3, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            conv(N, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            AttentionBlock(N),
+            conv(N, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            conv(N, M),
+            AttentionBlock(M),
+        )
+
+        self.g_s = nn.Sequential(
+            AttentionBlock(M),
+            deconv(M, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            deconv(N, N),
+            AttentionBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            deconv(N, N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            ResidualBottleneckBlock(N),
+            deconv(N, 3),
+        )
+
+        self.h_a = nn.Sequential(
+            conv3x3(M, N),
+            nn.ReLU(inplace=True),
+            conv(N, N),
+            nn.ReLU(inplace=True),
+            conv(N, N),
+        )
+
+        self.h_s = nn.Sequential(
+            deconv(N, N),
+            nn.ReLU(inplace=True),
+            deconv(N, N*3//2),
+            nn.ReLU(inplace=True),
+            conv3x3(N*3//2, 2*M),
+        )
+
+        gain = torch.ones([1,M,1,1],dtype=torch.float32)
+        self.gain = nn.Parameter(gain, requires_grad=True)
+        inverse_gain = torch.ones([1,M,1,1], dtype=torch.float32)
+        self.inverse_gain = nn.Parameter(inverse_gain, requires_grad=True)
+        self.quantizer = Quantizer()
+        self.gaussian_conditional = GaussianConditional(None)
+
+
+    def load_state_dict(self, state_dict):
+        update_registered_buffers(
+            self.gaussian_conditional,
+            "gaussian_conditional",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        super().load_state_dict(state_dict)
+
+    @classmethod
+
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        net = cls()
+        net.load_state_dict(state_dict)
+        return net
+
+    def update(self, scale_table=None, force=False):
+        if scale_table is None:
+            scale_table = get_scale_table()
+        updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
+        updated |= super().update(force=force)
+        return updated
+
+    def forward(self, x:Tensor, noisequant=False):
+        y = self.g_a(x)
+        B, C, H, W = y.size() ## The shape of y to generate the mask
+        y = self.gain.expand([B,C,H,W])*y
+
+        z = self.h_a(y)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        if not noisequant:
+            z_offset = self.entropy_bottleneck._get_medians()
+            z_tmp = z - z_offset
+            z_hat = quantize_ste(z_tmp) + z_offset
+        
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        _, y_likelihoods = self.gaussian_conditional(y, latent_scales, latent_means)
+        if noisequant:
+            y_hat = self.quantizer.quantize(y, quantize_type="ste")
+        else:
+            y_hat = self.quantizer.quantize(y-latent_means, quantize_type="ste")+latent_means
+        
+        y_hat = self.inverse_gain.expand([B,C,H,W])*y_hat
+        x_hat = self.g_s(y_hat)
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "latent_norm":(y-latent_means)/(latent_scales+TINY),
+        }
+
+
+    def compress(self,x:Tensor):
+        whole_time = time.time()
+        y_enc_start = time.time()
+        y = self.g_a(x)
+
+        y_enc = time.time() - y_enc_start
+        B, C, H, W = y.size()  ## The shape of y to generate the mask
+        y = self.gain.expand([B,C,H,W])*y
+
+        z_enc_start = time.time()
+        z = self.h_a(y)
+        z_enc = time.time() - z_enc_start
+        z_compress_time = time.time()
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_compress_time = time.time() - z_compress_time
+        
+        z_offset = self.entropy_bottleneck._get_medians().detach()
+        z_tmp = z - z_offset
+        z_hat = torch.round(z_tmp) + z_offset
+
+        #z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+        z_dec_start = time.time()
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        z_dec = time.time() - z_dec_start
+
+        y_compress_time = time.time()
+        indexes = self.gaussian_conditional.build_indexes(latent_scales)
+        y_strings = self.gaussian_conditional.compress(y, indexes=indexes, means=latent_means)
+        y_compress_time = time.time()
+        whole_time = time.time() - whole_time
+        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:],
+                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec,"whole":whole_time,
+                "z_compress_time":z_compress_time, "y_compress_time":y_compress_time},
+                "latent": y,
+                "latent_enc":torch.round(y-latent_means)
+                }
+
+
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 2
+        whole_time = time.time()
+        z_decompress_time = time.time()
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        z_decompress_time = time.time() -  z_decompress_time
+        B, _, _, _ = z_hat.size()
+        z_dec = time.time()
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        z_dec = time.time() - z_dec
+
+        y_strings = strings[0]
+        indexes = self.gaussian_conditional.build_indexes(latent_scales)
+        y_decompress_time = time.time()
+        y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=latent_means)
+        y_decompress_time = time.time() - y_decompress_time
+ 
+        y_dec = time.time()
+        B,C,H,W = y_hat.shape
+        y_hat = self.inverse_gain.expand([B,C,H,W])*y_hat
+        x_hat = self.g_s(y_hat)
+        y_dec = time.time() - y_dec
+        whole_time = time.time() - whole_time
+        return {"x_hat": x_hat, "time":{"z_dec":z_dec, "y_dec": y_dec, "whole":whole_time,
+                                        "z_decompress_time":z_decompress_time,"y_decompress_time":y_decompress_time}}
+    
+    #get bpp and psnr
+    def mask_inference(self, x, ch_idx):
+        y = self.g_a(x)
+        B,C,H,W = y.shape
+        y = self.gain.expand([B,C,H,W])*y
+        z = self.h_a(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_offset = self.entropy_bottleneck._get_medians()
+        z_hat = torch.round(z - z_offset) + z_offset
+
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2,1)
+        #mask
+        y[:,ch_idx,:,:] = latent_means[:,ch_idx,:,:]
+        y_hat = torch.round(y - latent_means) + latent_means
+        y_hat = self.inverse_gain.expand([B,C,H,W])*y_hat
+        x_hat = self.g_s(y_hat)
+        return x_hat
+
+
 if __name__=="__main__":
     x = torch.rand((1,3,256,256)).to("cuda")
-    net = AnnelModel().to("cuda")
+    net = HyperGain().to("cuda")
+    checkpoint_path = "/mnt/data3/jingwengu/ELIC_light/hyper_gain/lambda4/checkpoint_last_99.pth.tar"
+    state_dict = torch.load(checkpoint_path,map_location="cuda")
+    state_dict = state_dict["state_dict"]
+    net.load_state_dict(state_dict)
     net.update()
     net.cuda()
     out_forward = net.soft(x)

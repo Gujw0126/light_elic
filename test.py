@@ -23,8 +23,8 @@ import os
 import math
 import torch.nn as nn
 from teacher_models import*
-from skip_models import AnnelModel
 torch.backends.cudnn.deterministic = True
+from skip_models import*
 torch.set_num_threads(1)
 
 # from torchvision.datasets.folder
@@ -292,7 +292,8 @@ def main(argv):
     compressai.compressai.set_entropy_coder(args.entropy_coder)
 
     state_dict = load_state_dict(torch.load(args.paths))
-    model_cls = ELIC_original()
+    model_cls = ELICHyper()
+    print(model_cls.M)
     model = model_cls.from_state_dict(state_dict).eval()
     model.update()
     results = defaultdict(list)

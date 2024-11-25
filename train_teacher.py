@@ -35,6 +35,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 from MyUtils.utils.utils import DelfileList, load_checkpoint
 from teacher_models import*
 import logging
+from skip_models import HyperGain
 my_logger = logging.getLogger(__name__)
 
 
@@ -515,6 +516,7 @@ def main(argv):
         net.reset_parameters()
     """
     net = ELICHyper(N=args.N, M=args.M)
+    print(net.M)
     criterion = RateDistortionLoss(lmbda=args.lmbda)
     #TODO:other octave models
     net = net.to(device)

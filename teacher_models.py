@@ -6,6 +6,7 @@ from MyUtils.layers import*
 from compressai.compressai.ops import quantize_ste
 from compressai.compressai.models.utils import update_registered_buffers
 import math
+from compressai.compressai.zoo import load_state_dict
 import compressai.compressai
 from torch import Tensor
 import time
@@ -13,6 +14,8 @@ from ptflops import get_model_complexity_info
 from torchsummary import summary
 from thop import profile, clever_format
 from typing import cast
+from PIL import Image
+import torchvision
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
@@ -503,7 +506,7 @@ class ELICHyper(CompressionModel):
     """
     ELIC Model with only a hyperprior entropy model
     """
-    def __init__(self, N=192, M=320):
+    def __init__(self, N=192, M=160):
         super().__init__(entropy_bottleneck_channels=192)
         self.N = int(N)
         self.M = int(M)
@@ -2059,11 +2062,6 @@ if __name__=="__main__":
     #flops, params = get_model_complexity_info(net, (3, 256, 256), as_strings=True, print_per_layer_stat=True)
     #print('flops: ', flops, 'params: ', params)
     """
-    net = Cheng2020Attention(N=192).to("cuda")
-    net.update()
-    x = torch.rand((1,3,256,256)).to("cuda")
-    flops, params = get_model_complexity_info(net, (3, 256, 256), as_strings=True, print_per_layer_stat=True)
-    print('flops: ', flops, 'params: ', params)
     """
     entropy_coder = compressai.compressai.available_entropy_coders()[0]
     compressai.compressai.set_entropy_coder(entropy_coder)
@@ -2078,7 +2076,14 @@ if __name__=="__main__":
         print("compress_time:{:.4f}".format(compress_time))
         print("decopmress_time:{:.4f}".format(decompress_time))
     """
-
-
-
-    
+    img_path = '/mnt/data1/jingwengu/kodak1/kodim21.png'
+    img = Image.open(img_path).convert("RGB")
+    to_tensor = torchvision.transforms.ToTensor()
+    x = to_tensor(img).unsqueeze(0).to("cuda")
+    net_path = '/mnt/data3/jingwengu/ELIC_light/hyper/lambda1/correct.pth.tar'
+    net_cls = ELICHyper()
+    state_dict = load_state_dict(torch.load(net_path, map_location="cuda"))
+    net = net_cls.from_state_dict(state_dict).eval().to("cuda")
+    out_forward = net(x)
+    out_compress = net.compress(x)
+    print("compress over")

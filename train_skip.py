@@ -688,7 +688,7 @@ def main(argv):
     optimizer, aux_optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.3, patience=8)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3800], gamma=0.1)
-    temp = 10.0
+    temp = 2.0
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
         print("Loading", args.checkpoint)
@@ -701,6 +701,8 @@ def main(argv):
         temp = checkpoint["temp"]
 
     stemode = False ##set the pretrained flag
+    if args.pretrained:
+        stemode = True
     if args.checkpoint and args.pretrained:
         optimizer.param_groups[0]['lr'] = args.learning_rate
         aux_optimizer.param_groups[0]['lr'] = args.aux_learning_rate
@@ -715,7 +717,7 @@ def main(argv):
     for epoch in range(last_epoch, args.epochs):
         if temp>0.1:
             if epoch % 50==0 and epoch>0:
-                temp *= 0.8
+                temp *= 0.9
         if epoch > 3800 or stemode:
             noisequant = False
         print("noisequant: {}, stemode:{}".format(noisequant, stemode))
