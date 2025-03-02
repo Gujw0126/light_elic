@@ -8,7 +8,7 @@
 ## 2. 通道冗余现象
 模型中每个通道的重要程度并不相同，因此在编码层面，一些通道存在冗余。即对这些通道是否编码不会对模型的压缩性能产生较大的影响。以ELIC模型为例，不同通道的熵和对PSNR的贡献程度不尽相同。但是可以观察到通道熵越大，对PSNR的贡献越大。  
 ![image](https://github.com/Gujw0126/light_elic/blob/main/resource2/channel_entropy_original.png)    
-![image](https://github.com/Gujw0126/light_elic/blob/main/resource2/psnr_mask_original.png)  
+
 
 为获得每个通道的重要程度，在模型中引入缩放单元和反缩放单元，y经过缩放后再经过熵编码模块。一般来说，通道对应的缩放单元系数越大，该通道越重要。将通道的熵和PSNR图按照缩放系数升序排序可得到较好的递增趋势。  
 ![image](https://github.com/Gujw0126/light_elic/blob/main/resource2/hyper_gain_entropy.png)   
