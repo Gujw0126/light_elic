@@ -45,7 +45,8 @@ __all__=[
     "tgoctave5x5",
     "tgoctave5x5s2",
     "TLastGoctaveConv",
-    "WTAtten"
+    "WTAtten",
+    "ECA"
 ]
 
 
@@ -135,9 +136,9 @@ def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
     )
 
 
-def conv1x1(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
+def conv1x1(in_ch: int, out_ch: int, stride: int = 1, group_num=1) -> nn.Module:
     """1x1 convolution."""
-    return nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride)
+    return nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, groups=group_num)
 
 
 class AttentionBlock(nn.Module):
@@ -193,6 +194,20 @@ class AttentionBlock(nn.Module):
         out += identity
         return out
 
+
+class ECA(nn.Module):
+    def __init__(self, in_ch, k):
+        super().__init__()
+        self.k = k 
+        self.C = in_ch
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1,1,kernel_size=k, padding=k//2, bias=False)
+    
+    def forward(self, x:Tensor):
+        y = self.avg_pool(x)   #[N,C,1,1]
+        y = self.conv(y.squeeze(-1).transpose(-1,-2))  #[N,1,C]
+        y = y.transpose(-1,-2).unsqueeze(-1)  #[N,C,1,1]
+        return x*y.expand_as(x)
 
 
 class OctaveConv(nn.Module):

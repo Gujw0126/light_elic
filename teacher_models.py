@@ -15,7 +15,7 @@ from torchsummary import summary
 from thop import profile, clever_format
 from typing import cast
 from PIL import Image
-import torchvision
+import torchvision.transforms as transforms
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
@@ -290,22 +290,24 @@ class ELIC_original(CompressionModel):
 
     def compress(self, x):
         whole_time = time.time()
+        #y_enc: g_a
         y_enc_start = time.time()
         y = self.g_a(x)
         y_enc = time.time() - y_enc_start
         B, C, H, W = y.size()  ## The shape of y to generate the mask
-
+        #z_enc:h_a
         z_enc_start = time.time()
         z = self.h_a(y)
         z_enc = time.time() - z_enc_start
-        z_compress_time = time.time()
+        #z_e_enc:entropy coding time
+        z_e_enc_start = time.time()
         z_strings = self.entropy_bottleneck.compress(z)
-        z_compress_time = time.time() - z_compress_time
+        z_e_enc = time.time() - z_e_enc_start
 
         z_offset = self.entropy_bottleneck._get_medians()
         z_tmp = z - z_offset
         z_hat = quantize_ste(z_tmp) + z_offset
-
+        #z_dec:h_s 
         z_dec_start = time.time()
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
         z_dec = time.time() - z_dec_start
@@ -313,10 +315,10 @@ class ELIC_original(CompressionModel):
         y_slices = torch.split(y, self.groups[1:], 1)
 
         ctx_params_anchor_split = torch.split(torch.zeros(B, C * 2, H, W).to(x.device), [2 * i for i in self.groups[1:]], 1)
-
+        y_need_encode = []
         y_strings = []
         y_hat_slices = []
-        y_compress_time = 0
+        y_e_enc = 0
         for slice_index, y_slice in enumerate(y_slices):
             if slice_index == 0:
                 support_slices = []
@@ -332,10 +334,20 @@ class ELIC_original(CompressionModel):
             ##support mean and scale
             support = torch.concat([latent_means, latent_scales], dim=1) if slice_index == 0 else torch.concat(
                 [support_slices_ch_mean, support_slices_ch_scale, latent_means, latent_scales], dim=1)
+            #split
+            anchor_part = torch.zeros_like(y_slice)
+            non_anchor_part  = torch.zeros_like(y_slice)
+            anchor_part[:,:,0::2,0::2] = y_slice[:,:,0::2,0::2]
+            anchor_part[:,:,1::2,1::2] = y_slice[:,:,1::2,1::2]
+            non_anchor_part[:,:,0::2,1::2] = y_slice[:,:,0::2,1::2]
+            non_anchor_part[:,:,1::2,0::2] = y_slice[:,:,1::2, 0::2]
             ### checkboard process 1
             y_anchor = y_slices[slice_index].clone()
             means_anchor, scales_anchor, = self.ParamAggregation[slice_index](
                 torch.concat([ctx_params_anchor_split[slice_index], support], dim=1)).chunk(2, 1)
+            means_anchor_zero = torch.zeros_like(means_anchor)
+            means_anchor_zero[:,:,0::2,0::2] = means_anchor[:,:,0::2,0::2]
+            means_anchor_zero[:,:,1::2,1::2] = means_anchor_zero[:,:,1::2,1::2]
 
             B_anchor, C_anchor, H_anchor, W_anchor = y_anchor.size()
 
@@ -354,7 +366,7 @@ class ELIC_original(CompressionModel):
             indexes_anchor = self.gaussian_conditional.build_indexes(scales_anchor_encode)
             anchor_strings = self.gaussian_conditional.compress(y_anchor_encode, indexes_anchor, means=means_anchor_encode)
             compress_anchor = time.time() - compress_anchor
-            y_compress_time += compress_anchor
+            y_e_enc += compress_anchor
 
             anchor_quantized = self.quantizer.quantize(y_anchor_encode-means_anchor_encode, "ste") + means_anchor_encode
             #anchor_quantized = self.gaussian_conditional.decompress(anchor_strings, indexes_anchor, means=means_anchor_encode)
@@ -366,7 +378,9 @@ class ELIC_original(CompressionModel):
             masked_context = self.context_prediction[slice_index](y_anchor_decode)
             means_non_anchor, scales_non_anchor = self.ParamAggregation[slice_index](
                 torch.concat([masked_context, support], dim=1)).chunk(2, 1)
-
+            means_na_zero = torch.zeros_like(means_non_anchor)
+            means_na_zero[:,:,0::2,1::2] = 0
+            means_na_zero[:,:,1::2,0::2] = 0
             y_non_anchor_encode = torch.zeros(B_anchor, C_anchor, H_anchor, W_anchor // 2).to(x.device)
             means_non_anchor_encode = torch.zeros(B_anchor, C_anchor, H_anchor, W_anchor // 2).to(x.device)
             scales_non_anchor_encode = torch.zeros(B_anchor, C_anchor, H_anchor, W_anchor // 2).to(x.device)
@@ -383,7 +397,7 @@ class ELIC_original(CompressionModel):
             non_anchor_strings = self.gaussian_conditional.compress(y_non_anchor_encode, indexes_non_anchor,
                                                                     means=means_non_anchor_encode)
             compress_non_anchor = time.time() - compress_non_anchor
-            y_compress_time += compress_non_anchor
+            y_e_enc += compress_non_anchor
             non_anchor_quantized = self.quantizer.quantize(y_non_anchor_encode-means_non_anchor_encode, "ste") + means_non_anchor_encode
             #non_anchor_quantized = self.gaussian_conditional.decompress(non_anchor_strings, indexes_non_anchor,
             #                                                            means=means_non_anchor_encode)
@@ -391,15 +405,18 @@ class ELIC_original(CompressionModel):
             y_non_anchor_quantized = torch.zeros_like(means_anchor)
             y_non_anchor_quantized[:, :, 0::2, 1::2] = non_anchor_quantized[:, :, 0::2, :]
             y_non_anchor_quantized[:, :, 1::2, 0::2] = non_anchor_quantized[:, :, 1::2, :]
-
+    
+            y_slice_encode = torch.round(anchor_part-means_anchor_zero) + torch.round(non_anchor_part - means_na_zero) 
+            y_need_encode.append(y_slice_encode)
             y_slice_hat = y_anchor_decode + y_non_anchor_quantized
             y_hat_slices.append(y_slice_hat)
 
             y_strings.append([anchor_strings, non_anchor_strings])
         whole_time = time.time()-whole_time
+
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:],
-                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "y_compress_time":y_compress_time,
-                         "z_compress_time":z_compress_time,"whole":whole_time}}
+                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "y_e_enc":y_e_enc,
+                         "z_e_enc":z_e_enc,"whole":whole_time}}
 
 
     def decompress(self, strings, shape):
@@ -408,9 +425,9 @@ class ELIC_original(CompressionModel):
         # FIXME: we don't respect the default entropy coder and directly call thse
         # range ANS decoder
         whole_time = time.time()
-        z_decompress_time = time.time()
+        z_e_dec = time.time()
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
-        z_decompress_time = time.time() - z_decompress_time
+        z_e_dec = time.time() - z_e_dec
 
         B, _, _, _ = z_hat.size()
         z_dec = time.time()
@@ -424,7 +441,7 @@ class ELIC_original(CompressionModel):
         ctx_params_anchor_split = torch.split(ctx_params_anchor, [2 * i for i in self.groups[1:]], 1)
 
         y_hat_slices = []
-        y_decompress_time = 0
+        y_e_dec = 0
         for slice_index in range(len(self.groups) - 1):
             if slice_index == 0:
                 support_slices = []
@@ -461,7 +478,7 @@ class ELIC_original(CompressionModel):
             anchor_quantized = self.gaussian_conditional.decompress(anchor_strings, indexes_anchor,
                                                                     means=means_anchor_encode)
             anchor_decompress = time.time() - anchor_decompress
-            y_decompress_time += anchor_decompress
+            y_e_dec += anchor_decompress
 
             y_anchor_decode[:, :, 0::2, 0::2] = anchor_quantized[:, :, 0::2, :]
             y_anchor_decode[:, :, 1::2, 1::2] = anchor_quantized[:, :, 1::2, :]
@@ -485,7 +502,7 @@ class ELIC_original(CompressionModel):
             non_anchor_quantized = self.gaussian_conditional.decompress(non_anchor_strings, indexes_non_anchor,
                                                                         means=means_non_anchor_encode)
             non_anchor_decompress = time.time() - non_anchor_decompress
-            y_decompress_time += non_anchor_decompress
+            y_e_dec += non_anchor_decompress
 
             y_non_anchor_quantized = torch.zeros_like(means_anchor)
             y_non_anchor_quantized[:, :, 0::2, 1::2] = non_anchor_quantized[:, :, 0::2, :]
@@ -494,19 +511,20 @@ class ELIC_original(CompressionModel):
             y_slice_hat = y_anchor_decode + y_non_anchor_quantized
             y_hat_slices.append(y_slice_hat)
         y_hat = torch.cat(y_hat_slices, dim=1)
-
         y_dec_start = time.time()
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         y_dec = time.time() - y_dec_start
         whole_time = time.time() - whole_time
-        return {"x_hat": x_hat, "time":{"z_dec":z_dec,"y_dec": y_dec, "z_decompress_time":z_decompress_time,"y_decompress_time":y_decompress_time,"whole":whole_time}}
+        return {"x_hat": x_hat, 
+                "time":{"z_dec":z_dec,"y_dec": y_dec, "z_e_dec":z_e_dec,
+                        "y_e_dec":y_e_dec,"whole":whole_time}}
 
 
 class ELICHyper(CompressionModel):
     """
     ELIC Model with only a hyperprior entropy model
     """
-    def __init__(self, N=192, M=160):
+    def __init__(self, N=192, M=320):
         super().__init__(entropy_bottleneck_channels=192)
         self.N = int(N)
         self.M = int(M)
@@ -609,9 +627,9 @@ class ELICHyper(CompressionModel):
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
         _, y_likelihoods = self.gaussian_conditional(y, latent_scales, latent_means)
         if noisequant:
-            y_hat = self.quantizer.quantize(y, quantize_type="ste")
+            y_hat = self.quantizer.quantize(y, quantize_type="noise")
         else:
-            y_hat = self.quantizer.quantize(y-latent_means, quantize_type="ste")+latent_means
+            y_hat = self.quantizer.quantize(y-latent_means, quantize_type="ste") + latent_means
         x_hat = self.g_s(y_hat)
         return {
             "x_hat": x_hat,
@@ -2022,6 +2040,39 @@ class ELICDWT(ELICHyper):
         )
 
 
+class RateDistortionLoss(nn.Module):
+    """Custom rate distortion loss with a Lagrangian parameter."""
+
+    def __init__(self, lmbda=1e-2, alpha=0):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
+        self.alpha = alpha
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+        out["y_bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"]["y"]
+        )
+        out["z_bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"]["z"]
+        )
+        out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
+        #out["norm"] = torch.sum(output["norm"]) / num_pixels * 16 * 16 / 320
+        out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"] 
+
+        return out
+
+
 if __name__=="__main__":
     """
     net = ELIC_original().cuda()
@@ -2076,14 +2127,19 @@ if __name__=="__main__":
         print("compress_time:{:.4f}".format(compress_time))
         print("decopmress_time:{:.4f}".format(decompress_time))
     """
-    img_path = '/mnt/data1/jingwengu/kodak1/kodim21.png'
+    model_cls = ELICHyper(N=192, M=320)
+    model_path = "/mnt/data3/jingwengu/ELIC_light/hyper/lambda1/correct.pth.tar"
+    state_dict = load_state_dict(torch.load(model_path, map_location="cuda"))
+    model = model_cls.from_state_dict(state_dict).to("cuda").eval()
+    img_path = "/mnt/data1/jingwengu/kodak/kodim21.png"
     img = Image.open(img_path).convert("RGB")
-    to_tensor = torchvision.transforms.ToTensor()
-    x = to_tensor(img).unsqueeze(0).to("cuda")
-    net_path = '/mnt/data3/jingwengu/ELIC_light/hyper/lambda1/correct.pth.tar'
-    net_cls = ELICHyper()
-    state_dict = load_state_dict(torch.load(net_path, map_location="cuda"))
-    net = net_cls.from_state_dict(state_dict).eval().to("cuda")
-    out_forward = net(x)
-    out_compress = net.compress(x)
-    print("compress over")
+    trans = transforms.ToTensor()
+    img_tensor = trans(img).unsqueeze(0).to("cuda")
+    criterion = RateDistortionLoss(lmbda=4e-3, alpha=0.001)
+    out_forward = model(img_tensor)
+    out_criterion = criterion(out_forward, img_tensor)
+    print("bpp:{:.5f}".format(out_criterion["bpp_loss"].item()))
+    print("mse:{:.5f}".format(out_criterion["mse_loss"].item()))
+    print("z_bpp:{:.5f}".format(out_criterion["z_bpp_loss"].item()))
+    print("y_bpp:{:.5f}".format(out_criterion["y_bpp_loss"].item()))
+    

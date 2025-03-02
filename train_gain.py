@@ -19,6 +19,7 @@ import shutil
 import sys
 import os
 import time
+import pdb
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from MyUtils.datasets import ImageFolder
+from typing import List, Dict
 
 from tensorboardX import SummaryWriter
 from PIL import ImageFile
@@ -35,116 +37,48 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 from MyUtils.utils.utils import DelfileList, load_checkpoint
 from teacher_models import*
 import logging
-from skip_models import*
-from mask_model import*
+from skip_models import HyperGain, GainSkip
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+
 my_logger = logging.getLogger(__name__)
 
-
-MyTeacherModels = {
-    "ELIC_original":ELIC_original,
-    "ELICHyper": ELICHyper,
-    "ELICOctave": ELICOctave,
-    "ELICGOctave": ELICGOctave,
-    "ELICSkip": ELICSkip,
-    "GainCAR":GainCAR,
-    "HyperGain":HyperGain,
-    "HyperSkip":HyperSkip,
-    "MaskSkip":MaskSkip,
-    "GainCheckerboard":GainCheckerboard,
-    "ELIC_sort":ELIC_sort, 
-    "ELIC_gain":ELIC_gain, 
-}
 
 
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
-    def __init__(self, lmbda=1e-2, alpha=0):
+    def __init__(self):
         super().__init__()
         self.mse = nn.MSELoss()
-        self.lmbda = lmbda
-        self.alpha = alpha
 
-    def forward(self, output, target):
+    def forward(self, output, target, lmbda):
         N, _, H, W = target.size()
         out = {}
         num_pixels = N * H * W
 
-        out["bpp_loss"] = sum(
+        out["bpp"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"].values()
         )
-        out["y_bpp_loss"] = sum(
+        out["y_bpp"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"]["y"]
         )
-        out["z_bpp_loss"] = sum(
+        out["z_bpp"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"]["z"]
         )
-        out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
-        #out["norm"] = torch.sum(output["norm"]) 
-        out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
+        out["mse"] = self.mse(output["x_hat"], target) * 255 ** 2
+        out["loss"] = lmbda * out["mse"] + out["bpp"]
 
         return out
-
-class RateDistortionLoss2(nn.Module):
-    """Custom rate distortion loss with a Lagrangian parameter."""
-
-    def __init__(self, lmbda=1e-2):
-        super().__init__()
-        self.mse = nn.MSELoss()
-        self.lmbda = lmbda
-
-    def forward(self, output, target):
-        N, _, H, W = target.size()
-        out = {}
-        num_pixels = N * H * W
-
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
-        out["h_bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["h"]
-        )
-        out["l_bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["l"]
-        )
-        out["z_h_bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["z_h"]
-        )
-        out["z_l_bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["z_l"]
-        )
-        out["y_bpp_loss"] = out["l_bpp_loss"] + out["h_bpp_loss"]
-        out["z_bpp_loss"] = out["z_h_bpp_loss"] + out["z_l_bpp_loss"]
-        out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
-        out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
-
-        return out
-    
-
-#TODO:distangle loss
-class SpatialDistangleLoss(nn.Module):
-    pass
-
-class ChannelDistangleLoss(nn.Module):
-    pass
-
-
-class BiDistangleLoss(nn.Module):
-    pass
-
 
 
 class AverageMeter:
     """Compute running average."""
-
     def __init__(self):
         self.val = 0
         self.avg = 0
@@ -156,16 +90,6 @@ class AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-
-class CustomDataParallel(nn.DataParallel):
-    """Custom DataParallel to access the module methods."""
-
-    def __getattr__(self, key):
-        try:
-            return super().__getattr__(key)
-        except AttributeError:
-            return getattr(self.module, key)
 
 
 def configure_optimizers(net, args):
@@ -199,103 +123,121 @@ def configure_optimizers(net, args):
         (params_dict[n] for n in sorted(aux_parameters)),
         lr=args.aux_learning_rate, betas=(0.9, 0.999),
     )
-    return optimizer, aux_optimizer
+    return optimizer, aux_optimizer     
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, logger, noisequant=True,slice=0
+        model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, logger, lambdas, noisequant=True
 ):
     model.train()
     device = next(model.parameters()).device
-    train_loss = AverageMeter()
-    train_bpp_loss = AverageMeter()
-    train_y_bpp_loss = AverageMeter()
-    train_z_bpp_loss = AverageMeter()
-    train_mse_loss = AverageMeter()
+    lambda_len = len(lambdas)
+    train_loss = [AverageMeter() for _ in range(lambda_len)]
+    train_mse = [AverageMeter() for _ in range(lambda_len)]
+    train_bpp = [AverageMeter() for _ in range(lambda_len)]
+    train_y_bpp = [AverageMeter() for _ in range(lambda_len)]
+    train_z_bpp = [AverageMeter() for _ in range(lambda_len)]
 
     start = time.time()
     for i, d in enumerate(train_dataloader):
+        s = random.randint(0,lambda_len-1)
         d = d.to(device)
 
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
         out_net = model(d, noisequant)
+        out_criterion = criterion(out_net, d, lambdas[s])
 
-        out_criterion = criterion(out_net, d)
-        train_bpp_loss.update(out_criterion["bpp_loss"].item())
-        train_y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
-        train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
-        train_loss.update(out_criterion["loss"].item())
-        train_mse_loss.update(out_criterion["mse_loss"].item())
+        train_loss[s].update(out_criterion["loss"].item())
+        train_mse[s].update(out_criterion["mse"].item())
+        train_bpp[s].update(out_criterion["bpp"].item())
+        train_y_bpp[s].update(out_criterion["y_bpp"].item())
+        train_z_bpp[s].update(out_criterion["z_bpp"].item())
 
         out_criterion["loss"].backward()
         if clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
-
+        
+        #TODO: auxloss
         aux_loss = model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
-
-        if i % 10000 == 0:
+        if i % 8000 == 0:
             info = f"Train epoch {epoch}: ["\
-            f"{i*len(d)}/{len(train_dataloader.dataset)}"\
-            f" ({100. * i / len(train_dataloader):.0f}%)]"\
-            f'\tLoss: {out_criterion["loss"].item():.3f}|'\
-            f'\tMSE loss: {out_criterion["mse_loss"].item():.3f}|'\
-            f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f}|'\
-            f'\ty_Bpp loss: {out_criterion["y_bpp_loss"].item():.4f}|'\
-            f'\tz_Bpp loss: {out_criterion["z_bpp_loss"].item():.4f}|'\
-            f"\tAux loss: {aux_loss.item():.2f}"
+                f"{i*len(d)}/{len(train_dataloader.dataset)}"\
+                f" ({100. * i / len(train_dataloader):.0f}%)]"\
+                f'\tlambda={lambdas[s]:.4f}|'\
+                f'\tLoss: {out_criterion["loss"].item():.4f}|'\
+                f'\tMSE loss: {out_criterion["mse"].item():.4f}|'\
+                f'\tBpp loss: {out_criterion["bpp"].item():.4f}|'\
+                f'\ty_bpp loss: {out_criterion["y_bpp"].item():.4f}|'\
+                f'\tz_bpp loss: {out_criterion["z_bpp"].item():.4f}|'\
+                f'\tAux loss: {aux_loss.item():.4f}'
             print(info)
             logger.info(info)
+    
+    train_loss_avg = [meter.avg for meter in train_loss]
+    train_mse_avg = [meter.avg for meter in train_mse]
+    train_bpp_avg = [meter.avg for meter in train_bpp]
+    train_y_avg = [meter.avg for meter in train_y_bpp]
+    train_z_avg = [meter.avg for meter in train_z_bpp]
 
-    info = f"Train epoch {epoch}: Average losses:"\
-        f"\tLoss: {train_loss.avg:.3f}|"\
-        f"\tMSE loss: {train_mse_loss.avg:.3f}|"\
-        f"\tBpp loss: {train_bpp_loss.avg:.4f}|"\
-        f"\ty_Bpp loss: {train_y_bpp_loss.avg:.5f}|"\
-        f"\tz_Bpp loss: {train_z_bpp_loss.avg:.5f}|"\
-        f"\tTime (s) : {time.time()-start:.4f}" 
-
+    info = f"Train epoch {epoch}:"\
+        f"\tLoss: {sum(train_loss_avg):.4f}"\
+        f"\tMSE loss: {sum(train_mse_avg):.4f}"\
+        f'\tBpp loss: {sum(train_bpp_avg):.4f}'\
+        f'\ty_bpp loss: {sum(train_y_avg):.4f}'\
+        f'\tz_bpp loss: {sum(train_z_avg):.4f}'\
+        f"\tTime(s) :{time.time() - start:.4f}"
+    
     print(info)
     logger.info(info)
-    return train_loss.avg, train_bpp_loss.avg, train_mse_loss.avg
+    return train_loss_avg, train_mse_avg, train_bpp_avg, train_y_avg, train_z_avg
 
 
-def test_epoch(epoch, test_dataloader, model, criterion, logger, noisequant, slice):
+def test_epoch(
+        model, criterion, test_dataloader, epoch, logger, lambdas ,noisequant=True
+):
     model.eval()
     device = next(model.parameters()).device
-
-    loss = AverageMeter()
-    bpp_loss = AverageMeter()
-    y_bpp_loss = AverageMeter()
-    z_bpp_loss = AverageMeter()
-    mse_loss = AverageMeter()
-    aux_loss = AverageMeter()
+    lambda_len = len(lambdas)
+    test_loss = [AverageMeter() for _ in range(lambda_len)]
+    test_mse = [AverageMeter() for _ in range(lambda_len)]
+    test_bpp = [AverageMeter() for _ in range(lambda_len)]
+    test_y_bpp = [AverageMeter() for _ in range(lambda_len)]
+    test_z_bpp = [AverageMeter() for _ in range(lambda_len)]
 
     with torch.no_grad():
-        for d in test_dataloader:
+        start = time.time()
+        for i, d in enumerate(test_dataloader):
+            s = random.randint(0,lambda_len-1)
             d = d.to(device)
-            out_net = model(d,noisequant)
-            out_criterion = criterion(out_net, d)
-            aux_loss.update(model.aux_loss().item()) 
-            bpp_loss.update(out_criterion["bpp_loss"].item())
-            y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
-            z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
-            loss.update(out_criterion["loss"].item())
-            mse_loss.update(out_criterion["mse_loss"].item())
-    
-    info =  f"Test epoch {epoch}: Average losses:"\
-    f"\tLoss: {loss.avg:.3f}|"\
-    f"\tMSE loss: {mse_loss.avg:.3f}|"\
-    f"\tBpp loss: {bpp_loss.avg:.4f}|"\
-    f"\ty_Bpp loss: {y_bpp_loss.avg:.4f}|"\
-    f"\tz_Bpp loss: {z_bpp_loss.avg:.4f}|"\
-    f"\tAux loss: {aux_loss.avg:.4f}\n" 
+            out_net = model(d, noisequant)
+            out_criterion = criterion(out_net, d, lambdas[s])           
+            test_loss[s].update(out_criterion["loss"].item())
+            test_bpp[s].update(out_criterion["bpp"].item())
+            test_mse[s].update(out_criterion["mse"].item())
+            test_y_bpp[s].update(out_criterion["y_bpp"])
+            test_z_bpp[s].update(out_criterion["z_bpp"])
+            aux_loss = model.aux_loss()
+
+    test_loss_avg = [meter.avg for meter in test_loss]
+    test_mse_avg = [meter.avg for meter in test_mse]
+    test_bpp_avg = [meter.avg for meter in test_bpp]
+    test_y_avg = [meter.avg for meter in test_y_bpp]
+    test_z_avg = [meter.avg for meter in test_z_bpp]
+
+    info = f"Test epoch {epoch}:"\
+        f"\tLoss:{sum(test_loss_avg):.4f}"\
+        f"\tMSE loss:{sum(test_mse_avg):.4f}"\
+        f'\tBpp loss:{sum(test_bpp_avg):.4f}'\
+        f'\ty_bpp loss:{sum(test_y_avg):.4f}'\
+        f'\tz_bpp loss:{sum(test_z_avg):.4f}'\
+        f"\tTime(s) :{time.time() - start:.4f}"
     print(info)
     logger.info(info)
-    return loss.avg, bpp_loss.avg, mse_loss.avg
+    return test_loss_avg, test_mse_avg, test_bpp_avg, test_y_avg, test_z_avg
 
 
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
@@ -305,13 +247,6 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
     parser.add_argument(
         "-d", "--dataset", type=str, required=True, help="Training dataset"
-    )
-    parser.add_argument(
-        "-m","--model", type=str, choices=["ELIC_original","ELICHyper","ELIC_sort","ELICGOctave","ELICSkip","GainCAR","HyperGain", 
-                                           "HyperSkip","GainCheckerboard","ELIC_sort", "ELIC_gain"]
-    )
-    parser.add_argument(
-        "-q","--quality", type=int, choices=[1,2,3,4,5,6]
     )
     parser.add_argument(
         "--N",
@@ -326,14 +261,9 @@ def parse_args(argv):
         help="Number of channels of latent",
     )
     parser.add_argument(
-        "--alpha",
-        default=0.5,
-        type=float
-    )
-    parser.add_argument(
         "-e",
         "--epochs",
-        default=4000,
+        default=1000,
         type=int,
         help="Number of epochs (default: %(default)s)",
     )
@@ -352,10 +282,11 @@ def parse_args(argv):
         help="Dataloaders threads (default: %(default)s)",
     )
     parser.add_argument(
-        "--lambda",
-        dest="lmbda",
+        "--lambdas",
+        dest="lmbdas",
         type=float,
-        default=15e-3,
+        nargs=8,
+        default=(0.0018, 0.0035, 0.0067, 0.0130, 0.0250, 0.0483, 0.0932, 0.18),
         help="Bit-rate distortion parameter (default: %(default)s)",
     )
     parser.add_argument(
@@ -401,8 +332,6 @@ def parse_args(argv):
     parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
     parser.add_argument('--savepath', default='./checkpoint', type=str, help='Path to save the checkpoint')
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--finetune", type=str)
-    parser.add_argument("--slice", type=int)
     args = parser.parse_args(argv)
     return args
 
@@ -448,28 +377,10 @@ def main(argv):
         shuffle=False,
         pin_memory=(device == "cuda"),
     )
-
-    if args.model=="ELIC_sort" and args.finetune:
-        net = ELIC_sort()
-        net_state_dict = net.state_dict()
-        hyper_state_dict = torch.load(args.finetune, map_location=device)
-        for key in hyper_state_dict.keys():
-            if key.startswith("g_a") or key.startswith("g_s"):
-                net_state_dict[key] = hyper_state_dict[key]
-            if key.startswith("gain") or key.startswith("inverse_gain"): 
-                net_state_dict[key] = hyper_state_dict[key]   
-                net_state_dict[key].requires_grad = False
-        
-        net.load_state_dict(net_state_dict)
-        print("loading")
-        print(net.gain_indices)
-        net.update_indices()
-        print(net.gain_indices)
-    else:
-        net = MyTeacherModels[args.model]()
-
+    discrete_num = len(args.lmbdas)
+    net = HyperGain(N=192,M=320, r_num=discrete_num)
     print(net.M)
-    criterion = RateDistortionLoss(lmbda=args.lmbda, alpha=0.)
+    criterion = RateDistortionLoss()
     #TODO:other octave models
     net = net.to(device)
     if not os.path.exists(args.savepath):
@@ -480,7 +391,6 @@ def main(argv):
     writer = SummaryWriter(args.savepath)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.3, patience=8)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3800], gamma=0.1)
     
     last_epoch = 0
@@ -493,14 +403,12 @@ def main(argv):
         optimizer.load_state_dict(checkpoint["optimizer"])
         aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-        print(net.gain)
 
     stemode = False ##set the pretrained flag
     if args.checkpoint and args.pretrained:
         optimizer.param_groups[0]['lr'] = args.learning_rate
         aux_optimizer.param_groups[0]['lr'] = args.aux_learning_rate
         del lr_scheduler
-        # lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100], gamma=0.1)
         lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.1, patience=10)
         last_epoch = 0
         stemode = True
@@ -508,12 +416,11 @@ def main(argv):
     noisequant = True
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
-        if epoch > 3800 or stemode:
+        if epoch > 1000 or stemode:
             noisequant = False
         print("noisequant: {}, stemode:{}".format(noisequant, stemode))
         print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        #assert isinstance(criterion, RateDistortionLoss2)
-        train_loss, train_bpp, train_mse = train_one_epoch(
+        train_loss, train_mse, train_bpp, train_y_bpp, train_z_bpp = train_one_epoch(
             net,
             criterion,
             train_dataloader,
@@ -522,21 +429,39 @@ def main(argv):
             epoch,
             args.clip_max_norm,
             my_logger,
-            noisequant, 
-            args.slice
+            args.lmbdas,
+            noisequant
         )
-        writer.add_scalar('Train/loss', train_loss, epoch)
-        writer.add_scalar('Train/mse', train_mse, epoch)
-        writer.add_scalar('Train/bpp', train_bpp, epoch)
 
-        loss, bpp, mse = test_epoch(epoch, test_dataloader, net, criterion, my_logger, noisequant, args.slice)
-        writer.add_scalar('Test/loss', loss, epoch)
-        writer.add_scalar('Test/mse', mse, epoch)
-        writer.add_scalar('Test/bpp', bpp, epoch)
-        lr_scheduler.step(loss)
+        for i, lmbda in enumerate(args.lmbdas):
+            writer.add_scalar('Train/loss_lambda={}'.format(lmbda), train_loss[i], epoch)
+            writer.add_scalar('Train/mse_lambda={}'.format(lmbda), train_mse[i], epoch)
+            writer.add_scalar('Train/bpp_lambda={}'.format(lmbda), train_bpp[i], epoch)
+            writer.add_scalar('Train/y_bpp_lambda={}'.format(lmbda), train_y_bpp[i], epoch)
+            writer.add_scalar('Train/z_bpp_lambda={}'.format(lmbda), train_z_bpp[i], epoch)
 
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
+        test_loss, test_mse, test_bpp, test_y_bpp, test_z_bpp = test_epoch(
+            net, 
+            criterion,
+            test_dataloader,
+            epoch, 
+            my_logger,
+            args.lmbdas, 
+            noisequant
+            )
+
+        for i, lmbda in enumerate(args.lmbdas):
+            writer.add_scalar('Test/loss_lambda={}'.format(lmbda), test_loss[i], epoch)
+            writer.add_scalar('Test/mse_lambda={}'.format(lmbda), test_mse[i], epoch)
+            writer.add_scalar('Test/bpp_lambda={}'.format(lmbda), test_bpp[i], epoch)
+            writer.add_scalar('Test/y_bpp_lambda={}'.format(lmbda), test_y_bpp[i], epoch)
+            writer.add_scalar('Test/z_bpp_lambda={}'.format(lmbda), test_z_bpp[i], epoch)
+        
+        total_test_loss = sum(test_loss)
+        lr_scheduler.step(total_test_loss)
+
+        is_best = total_test_loss < best_loss
+        best_loss = min(total_test_loss, best_loss)
 
         if args.save:
             DelfileList(args.savepath, "checkpoint_last")
@@ -544,7 +469,7 @@ def main(argv):
                 {
                     "epoch": epoch,
                     "state_dict": net.state_dict(),
-                    "loss": loss,
+                    "loss": total_test_loss,
                     "optimizer": optimizer.state_dict(),
                     "aux_optimizer": aux_optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
@@ -557,7 +482,7 @@ def main(argv):
                     {
                         "epoch": epoch,
                         "state_dict": net.state_dict(),
-                        "loss": loss,
+                        "loss": total_test_loss,
                         "optimizer": optimizer.state_dict(),
                         "aux_optimizer": aux_optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),

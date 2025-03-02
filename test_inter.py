@@ -22,8 +22,8 @@ import torch
 import os
 import math
 import torch.nn as nn
-from teacher_models import ELICHyper, ELIC_original
-from skip_models import*
+from teacher_models import ELICHyper
+from skip_models import HyperGain
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
 
@@ -58,12 +58,11 @@ def read_image(filepath: str) -> torch.Tensor:
 
 
 @torch.no_grad()
-def inference(model, x, f, outputpath, patch,fre, use_num):
+def inference(model, x, f, outputpath, patch, use_num):
     x = x.unsqueeze(0)
     imgpath = f.split('/')
     imgpath[-2] = outputpath
-    imgPath = '/'.join(imgpath)
-    csvfile = outputpath + '/result_{}.csv'.format(use_num)
+    csvfile = outputpath + '/result{}.csv'.format(use_num)
     print('decoding img: {}'.format(f))
 ########original padding
     h, w = x.size(2), x.size(3)
@@ -77,22 +76,12 @@ def inference(model, x, f, outputpath, patch,fre, use_num):
     pad = nn.ConstantPad2d((padding_left, padding_right, padding_top, padding_bottom), 0)
     x_padded = pad(x)
     x_original = x
-    if fre:
-        gaussian_kernel = torch.tensor([[0.0947416,0.118318,0.0947416],[0.118318,0.147761,0.118318],[0.0947416,0.118318,0.0947416]],dtype=torch.float32,device=x.device)
-        #gaussian_kernel = torch.tensor([[0,0,0],[0,1,0],[0,0,0]],dtype=torch.float32,device=x.device)
-        gaussian_kernel = gaussian_kernel.unsqueeze(0).unsqueeze(0).expand([3,1,3,3])
-        bias = torch.tensor([0,0,0],dtype=torch.float32,device=x.device)
-        x_padded = F.conv2d(input=x_padded, weight=gaussian_kernel, bias=bias, stride=1, padding=1,groups=3)
-        x_original = nn.functional.pad(x_padded,[-padding_left, -padding_right, -padding_top, -padding_bottom])
-        torchvision.utils.save_image(x_original, os.path.join(outputpath,"kodim_fre21.png"),nrow=1)
-
-    _, _, height, width = x_padded.size()
     start = time.time()
-    out_enc = model.compress(x_padded,use_num)
+    out_enc = model.compress(x_padded, use_num)
     enc_time = time.time() - start
 
     start = time.time()
-    out_dec = model.decompress(out_enc["strings"], out_enc["shape"],use_num)
+    out_dec = model.decompress(out_enc["strings"], out_enc["shape"], use_num)
     dec_time = time.time() - start
 
     out_dec["x_hat"] = torch.nn.functional.pad(
@@ -122,9 +111,8 @@ def inference(model, x, f, outputpath, patch,fre, use_num):
     with open(csvfile, 'a+') as f:
         row = [imgpath[-1], bpp * num_pixels, num_pixels, bpp, y_bpp, z_bpp,
                torch.nn.functional.mse_loss(x, out_dec["x_hat"]).item() * 255 ** 2, psnr(x, out_dec["x_hat"]),
-               ms_ssim(x, out_dec["x_hat"], data_range=1.0).item(), out_enc["time"]['whole']*1000, out_dec["time"]['whole']*1000,
-               out_enc["time"]['y_enc'] * 1000,out_dec["time"]['y_dec'] * 1000, out_enc["time"]['z_enc'] * 1000, out_dec["time"]['z_dec'] * 1000,
-               out_enc["time"]['y_e_enc']*1000, out_dec["time"]['y_e_dec']*1000, out_enc["time"]['z_e_enc']*1000, out_dec["time"]['z_e_dec']*1000]
+               ms_ssim(x, out_dec["x_hat"], data_range=1.0).item(), enc_time, dec_time]
+               #out_enc["time"]['y_enc'] * 1000,out_dec["time"]['y_dec'] * 1000, out_enc["time"]['z_enc'] * 1000, out_enc["time"]['z_dec'] * 1000]
         write = csv.writer(f)
         write.writerow(row)
     print('bpp:{}, PSNR: {}, encoding time: {}, decoding time: {}'.format(bpp, PSNR, enc_time, dec_time))
@@ -135,67 +123,8 @@ def inference(model, x, f, outputpath, patch,fre, use_num):
         "decoding_time": dec_time,
     }
 
-@torch.no_grad()
-def inference_entropy_estimation(model, x, f, outputpath, patch):
-    x = x.unsqueeze(0)
-    imgpath = f.split('/')
-    imgpath[-2] = outputpath
-    imgPath = '/'.join(imgpath)
-    csvfile = '/'.join(imgpath[:-1]) + '/result.csv'
-    print('decoding img: {}'.format(f))
-    ########original padding
-    h, w = x.size(2), x.size(3)
-    p = patch  # maximum 6 strides of 2
-    new_h = (h + p - 1) // p * p
-    new_w = (w + p - 1) // p * p
-    padding_left = (new_w - w) // 2
-    padding_right = new_w - w - padding_left
-    padding_top = (new_h - h) // 2
-    padding_bottom = new_h - h - padding_top
-    x_padded = torch.nn.functional.pad(
-        x,
-        (padding_left, padding_right, padding_top, padding_bottom),
-        mode="constant",
-        value=0,
-    )
-    _, _, height, width = x_padded.size()
 
-
-    start = time.time()
-    out_net = model.inference(x_padded)
-
-
-    elapsed_time = time.time() - start
-    out_net["x_hat"] = torch.nn.functional.pad(
-        out_net["x_hat"], (-padding_left, -padding_right, -padding_top, -padding_bottom)
-    )
-    num_pixels = x.size(0) * x.size(2) * x.size(3)
-    bpp = sum(
-        (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-        for likelihoods in out_net["likelihoods"].values()
-    )
-    y_bpp = (torch.log(out_net["likelihoods"]["y"]).sum() / (-math.log(2) * num_pixels))
-    z_bpp = (torch.log(out_net["likelihoods"]["y"]).sum() / (-math.log(2) * num_pixels))
-
-    torchvision.utils.save_image(out_net["x_hat"], imgPath, nrow=1)
-    PSNR = psnr(x, out_net["x_hat"])
-    with open(csvfile, 'a+') as f:
-        row = [imgpath[-1], bpp.item() * num_pixels, num_pixels, bpp.item(), y_bpp.item(), z_bpp.item(),
-               torch.nn.functional.mse_loss(x, out_net["x_hat"]).item() * 255 ** 2, PSNR,
-               ms_ssim(x, out_net["x_hat"], data_range=1.0).item(), elapsed_time / 2.0, elapsed_time / 2.0,
-               out_net["time"]['y_enc'] * 1000, out_net["time"]['y_dec'] * 1000, out_net["time"]['z_enc'] * 1000,
-               out_net["time"]['z_dec'] * 1000, out_net["time"]['params'] * 1000]
-        write = csv.writer(f)
-        write.writerow(row)
-    return {
-        "psnr": PSNR,
-        "bpp": bpp.item(),
-        "encoding_time": elapsed_time / 2.0,  # broad estimation
-        "decoding_time": elapsed_time / 2.0,
-    }
-
-
-def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpath='Recon', patch=576, frequency=False, use_num=160):
+def eval_model(model, filepaths, outputpath='Recon', patch=576, use_ch=320):
     device = next(model.parameters()).device
     metrics = defaultdict(float)
     imgdir = filepaths[0].split('/')
@@ -203,28 +132,23 @@ def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpat
     imgDir = '/'.join(imgdir[:-1])
     if not os.path.isdir(imgDir):
         os.makedirs(imgDir)
-    csvfile = outputpath + '/result_{}.csv'.format(use_num)
+    csvfile = outputpath + '/result{}.csv'.format(use_ch)
     if os.path.isfile(csvfile):
         os.remove(csvfile)
     with open(csvfile, 'w') as f:
         row = ['name', 'bits', 'pixels', 'bpp', 'y_bpp', 'z_bpp', 'mse', 'psnr(dB)', 'ms-ssim', 'enc_time(s)', 'dec_time(s)', 'y_enc(ms)',
-               'y_dec(ms)', 'z_enc(ms)', 'z_dec(ms)', 'y_entropy_code(ms)','y_entropy_decode(ms)','z_entropy_encode(ms)','z_entropy_decode(ms)']
+               'y_dec(ms)', 'z_enc(ms)', 'z_dec(ms)', 'param(ms)']
         write = csv.writer(f)
         write.writerow(row)
     for f in filepaths:
         x = read_image(f).to(device)
-        if not entropy_estimation:
-            if half:
-                model = model.half()
-                x = x.half()
-            rv = inference(model, x, f, outputpath, patch, frequency, use_num)
-        else:
-            rv = inference_entropy_estimation(model, x, f, outputpath, patch)
+        rv = inference(model, x, f, outputpath, patch, use_ch)
         for k, v in rv.items():
             metrics[k] += v
     for k, v in metrics.items():
         metrics[k] = v / len(filepaths)
     return metrics
+
 
 def setup_args():
     parser = argparse.ArgumentParser(
@@ -274,12 +198,9 @@ def setup_args():
         help="padding patch size (default: %(default)s)",
     )
     parser.add_argument(
-        "--frequency",
-        action="store_true"
-    )
-    parser.add_argument(
-        "--use_num",
-        type=int
+        "--use_ch",
+        type=int, 
+        default=320
     )
     return parser
 
@@ -300,20 +221,17 @@ def main(argv):
     model_cls = HyperGain()
     print(model_cls.M)
     model = model_cls.from_state_dict(state_dict).eval()
+    model.update()
     results = defaultdict(list)
 
     if args.cuda and torch.cuda.is_available():
         model = model.to("cuda")
 
-    metrics = eval_model(model, filepaths, args.entropy_estimation, args.half, args.output_path, args.patch, args.frequency, args.use_num)
+    metrics = eval_model(model, filepaths, args.output_path, args.patch, args.use_ch)
     for k, v in metrics.items():
         results[k].append(v)
 
-    description = (
-        "entropy estimation" if args.entropy_estimation else args.entropy_coder
-    )
     output = {
-        "description": f"Inference ({description})",
         "results": results,
     }
     print(json.dumps(output, indent=2))
